@@ -251,6 +251,12 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
 
     // Create command with all necessary wine env variables
     let mut binding = Command::new(wine_path.clone());
+    // MAXIMA-LINUX-PORT-MOD: detach stdin so Wine does not spawn a
+    // wineconsole for console-subsystem helpers like wine-helper.exe.
+    // Wine treats an inherited terminal-stdin as "interactive user
+    // present" and pops up a black console window; Stdio::null keeps
+    // those helpers headless.
+    binding.stdin(Stdio::null());
     let mut child = binding
         .env("WINEPREFIX", proton_prefix_path)
         .env("GAMEID", "umu-0")
@@ -284,13 +290,24 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     if want_output {
         let output = child
             .stdout(Stdio::piped())
+            // MAXIMA-LINUX-PORT-MOD: silence stderr so Wine/umu fixme spam
+            // does not leak into the parent terminal (matches Windows-side
+            // GUI behaviour where helper subprocesses are silent).
+            .stderr(Stdio::null())
             .spawn()?
             .wait_with_output()
             .await?;
         output_str = String::from_utf8_lossy(&output.stdout).to_string();
         status = output.status;
     } else {
-        status = child.spawn()?.wait().await?;
+        // MAXIMA-LINUX-PORT-MOD: silence both streams when the caller does
+        // not need stdout — same rationale as the wineconsole/stderr fix above.
+        status = child
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?
+            .wait()
+            .await?;
     };
 
     if !status.success() {

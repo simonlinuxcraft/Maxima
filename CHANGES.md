@@ -8,6 +8,18 @@ These modifications remain licensed under **GPL-3.0**, matching the
 upstream license. Each entry below documents what was changed, when,
 and why, in line with GPLv3 §5 (modification notice).
 
+## 2026-05-07 — `wine.rs`: silence subprocess stdio (no wineconsole popup)
+
+Identical to the Launcher-tree fix on this function:
+- `binding.stdin(Stdio::null())` after the `Command::new` construction.
+- `.stderr(Stdio::null())` added when `want_output == true`.
+- `.stdout(Stdio::null()).stderr(Stdio::null())` when `want_output == false`.
+
+Reason: Wine pops up a wineconsole UI window for console-subsystem helpers
+like `wine-helper.exe` if it sees an inherited terminal-stdin. Detaching
+stdin and silencing output streams keeps the helpers headless on Linux,
+matching Windows-side behaviour.
+
 A second copy of this Maxima tree lives at `Kyber/ThirdParty/Maxima/`
 (used by the Flutter Launcher build). The LSX patches below are kept
 byte-identical between the two trees. Two divergences exist as of
