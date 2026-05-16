@@ -20,6 +20,26 @@ below).
 
 ---
 
+## 2026-05-07 — `wine.rs`: silence subprocess stdio (no wineconsole popup)
+
+**Files touched**
+- `maxima-lib/src/unix/wine.rs` — in `run_wine_command()`:
+  - Added `binding.stdin(Stdio::null())` immediately after the `Command::new`
+    construction.
+  - When `want_output == true`, added `.stderr(Stdio::null())` to the spawn chain.
+  - When `want_output == false`, replaced the bare `child.spawn()?` with
+    `.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?`.
+
+**Why**
+Without these stdio overrides Wine spawns a wineconsole window when
+launching console-subsystem helpers (`wine-helper.exe`), because it
+treats an inherited terminal-stdin as a sign that an interactive user
+is present. Detaching stdin and silencing helper output streams keeps
+the helpers headless and matches the Windows GUI behaviour.
+
+**Upstream tracking**
+Portable to upstream as a standalone change.
+
 ## 2026-05-05 — `wine.rs`: registry-setup refactor + UMU_ZENITY env
 
 **Files touched**
