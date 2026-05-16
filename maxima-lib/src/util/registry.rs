@@ -478,7 +478,17 @@ pub fn read_game_path(_name: &str) -> Result<PathBuf, RegistryError> {
 
 #[cfg(target_os = "linux")]
 pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
-    Ok(module_path()?.safe_parent()?.join("maxima-bootstrap"))
+    // MAXIMA-LINUX-PORT-MOD: when running as the Launcher FFI (kyber_launcher
+    // in bundle/), /proc/self/exe points to bundle/ — bootstrap lives in
+    // bundle/cli/. When running as the CLI (kyber_cli in bundle/cli/),
+    // /proc/self/exe points to bundle/cli/ — bootstrap is right next to it.
+    let exe = module_path()?;
+    let base = exe.safe_parent()?;
+    let cli_subdir = base.join("cli").join("maxima-bootstrap");
+    if cli_subdir.exists() {
+        return Ok(cli_subdir);
+    }
+    Ok(base.join("maxima-bootstrap"))
 }
 
 #[cfg(target_os = "macos")]

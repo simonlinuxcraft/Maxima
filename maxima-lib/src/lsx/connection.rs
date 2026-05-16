@@ -17,6 +17,7 @@ use tokio::sync::{MutexGuard, RwLock};
 use super::{
     request::{
         account::handle_query_entitlements_request,
+        achievements::handle_query_achievements_request,
         auth::handle_auth_code_request,
         challenge::handle_challenge_response,
         config::handle_config_request,
@@ -157,14 +158,18 @@ pub fn get_os_pid(context: &ActiveGameContext) -> Result<u32, NativeError> {
             continue;
         }
 
-        let mut cmd = process.cmd()[0].to_owned();
+        // MAXIMA-LINUX-PORT-MOD: under Wine/Proton, cmd[0] is the wine binary
+        // (e.g. wine64) while the game exe path appears in cmd[1] or later.
+        // Check all args so we find the process regardless of Wine invocation style.
+        let game_path_found = process.cmd().iter().any(|arg| {
+            let mut s = arg.to_owned();
+            if cfg!(unix) && s.starts_with("Z:") {
+                s = s.replace("Z:", "").replace('\\', "/");
+            }
+            s.starts_with(context.game_path())
+        });
 
-        // Wine path handling
-        if cfg!(unix) && cmd.starts_with("Z:") {
-            cmd = cmd.replace("Z:", "").replace('\\', "/");
-        }
-
-        if !cmd.starts_with(context.game_path()) {
+        if !game_path_found {
             continue;
         }
 
@@ -221,27 +226,29 @@ impl Connection {
         // The PID system is mainly for Kyber injection
         let mut pid = get_os_pid(context);
         if cfg!(unix) {
-            if let Ok(os_pid) = pid {
-                let sys = System::new_all();
-                if let Some(process) = sys.process(Pid::from_u32(os_pid)) {
-                    let filename = PathBuf::from(
-                        process.cmd()[0]
-                            .to_owned()
-                            .replace("Z:", "")
-                            .replace('\\', "/"),
-                    )
-                    .file_name()
-                    .ok_or(NativeError::FileName)?
-                    .to_str()
-                    .ok_or(NativeError::Stringify)?
-                    .to_owned();
-
-                    pid = get_wine_pid(&context.launch_id(), &filename).await;
-                } else {
+            if let Ok(_os_pid) = pid {
+                // MAXIMA-LINUX-PORT-MOD: deterministic Wine-PID lookup.
+                //
+                // Previously this walked process.cmd()[] of the MXLaunchId-tagged
+                // Linux process to find the .exe arg. That race-loses under
+                // umu-run/pressure-vessel because by the time LSX connects and
+                // we get here, the matched process may already have re-exec'd
+                // through python3 / bwrap / proton — its argv no longer
+                // contains the original game .exe path. The fallback to cmd()[0]
+                // produced wine-helper.exe queries for "python3" or "bwrap",
+                // both of which return PID 0, breaking inject silently.
+                //
+                // ActiveGameContext now carries the .exe filename captured
+                // from launch.rs::start_game() at spawn time, before any
+                // re-exec can mangle it. Use that directly.
+                let filename = context.game_exe_filename();
+                if filename.is_empty() {
                     warn!(
-                        "Failed to find game process while looking for PID {}",
-                        os_pid
+                        "ActiveGameContext.game_exe_filename is empty — \
+                         wine_get_pid will likely fail. Check launch.rs"
                     );
+                } else {
+                    pid = get_wine_pid(&context.launch_id(), filename).await;
                 }
             }
         }
@@ -294,6 +301,8 @@ impl Connection {
 
         let n = match self.stream.read(&mut buffer) {
             Ok(n) if n == 0 => {
+                // MAXIMA-LINUX-PORT-MOD: Diagnostic for LSX disconnect detection
+                warn!("LSX peer closed socket cleanly (FIN received)");
                 return Err(LSXConnectionError::Closed);
             }
             Ok(n) => n,
@@ -302,6 +311,8 @@ impl Connection {
                 if kind == ErrorKind::WouldBlock {
                     return Ok(());
                 }
+                // MAXIMA-LINUX-PORT-MOD: Diagnostic for LSX disconnect detection
+                warn!("LSX read error: kind={:?}", kind);
                 return Err(LSXConnectionError::Internal(kind));
             }
         };
@@ -435,6 +446,7 @@ impl Connection {
             GetVoipStatus handle_voip_status_request,
             ShowIGOWindow handle_show_igo_window_request,
             SetDownloaderUtilization handle_set_downloader_util_request,
+            QueryAchievements handle_query_achievements_request,
         );
 
         Ok(match result {

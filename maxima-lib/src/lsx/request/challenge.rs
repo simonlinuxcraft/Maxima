@@ -28,8 +28,8 @@ pub async fn handle_challenge_response(
     };
 
     info!(
-        "Game Connected - Name: {}, Offer ID: {}, Multiplayer Id: {}",
-        message.title, message.content_id, message.multiplayer_id
+        "Game Connected - Name: {}, Offer ID: {}, Multiplayer Id: {}, Language: {}",
+        message.title, message.content_id, message.multiplayer_id, message.language
     );
 
     let encryption_key = make_lsx_key(seed);

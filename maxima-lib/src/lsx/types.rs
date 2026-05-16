@@ -114,6 +114,8 @@ pub enum LSXRequestType {
     GetVoipStatus(LSXGetVoipStatus),
     ShowIGOWindow(LSXShowIGOWindow),
     SetDownloaderUtilization(LSXSetDownloaderUtilization),
+    // MAXIMA-LINUX-PORT-MOD: Issue #2 stub. See CHANGES.md.
+    QueryAchievements(LSXQueryAchievements),
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -138,6 +140,8 @@ pub enum LSXResponseType {
     QueryEntitlementsResponse(LSXQueryEntitlementsResponse),
     QueryImageResponse(LSXQueryImageResponse),
     GetVoipStatusResponse(LSXGetVoipStatusResponse),
+    // MAXIMA-LINUX-PORT-MOD: Issue #2 stub response. See CHANGES.md.
+    QueryAchievementsResponse(LSXQueryAchievementsResponse),
 }
 
 pub fn create_lsx_message(r#type: LSXMessageType) -> LSX {
@@ -373,6 +377,18 @@ lsx_message! {
     SetDownloaderUtilization;
     attr {
         Utilization: f32
+    },
+    data {}
+}
+
+// MAXIMA-LINUX-PORT-MOD: Issue #2 stub message types. See CHANGES.md.
+lsx_message! {
+    QueryAchievements;
+    attr {
+        UserId: Option<String>,
+        OfferId: Option<String>,
+        Locale: Option<String>,
+        version: Option<String>,
     },
     data {}
 }
@@ -753,4 +769,23 @@ lsx_message! {
         Active: bool,
     },
     data {}
+}
+
+// MAXIMA-LINUX-PORT-MOD: Issue #2 stub response types. See CHANGES.md.
+lsx_message! {
+    Achievement;
+    attr {
+        AchievementId: String,
+        Unlocked: bool,
+        UnlockedDate: String,
+    },
+    data {}
+}
+
+lsx_message! {
+    QueryAchievementsResponse;
+    attr {},
+    data {
+        achievement: Vec<LSXAchievement>,
+    }
 }

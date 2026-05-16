@@ -33,8 +33,14 @@ pub async fn start_server(port: u16, maxima: LockedMaxima) -> Result<(), LSXServ
                 warn!("Failed to process LSX message queue");
             }
 
-            if let Err(_) = connection.listen().await {
-                warn!("LSX connection closed");
+            if let Err(e) = connection.listen().await {
+                // MAXIMA-LINUX-PORT-MOD: Distinguish clean FIN vs internal error
+                let reason = match &e {
+                    LSXConnectionError::Closed => "clean FIN",
+                    LSXConnectionError::Internal(_) => "internal io",
+                    _ => "other",
+                };
+                warn!("LSX connection closed: {}", reason);
                 connections.remove(idx);
                 maxima
                     .lock()

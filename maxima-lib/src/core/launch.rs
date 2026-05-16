@@ -113,6 +113,16 @@ impl LaunchMode {
 pub struct ActiveGameContext {
     launch_id: String,
     game_path: String,
+    /// MAXIMA-LINUX-PORT-MOD: Name of the game executable file (e.g.
+    /// `starwarsbattlefrontii.exe`). On Linux/umu the launcher process tree
+    /// re-execs through python3/bwrap/proton; the only stable way to find
+    /// the Wine PID is to ask `wine-helper.exe get_pid <exe_filename>` with
+    /// the original Windows-side .exe name. Walking `/proc/<pid>/cmdline`
+    /// of the matched MXLaunchId process is racy because by the time LSX
+    /// connects, the process may have already re-exec'd and the exe arg
+    /// is gone from argv. Threading the filename through here keeps it
+    /// deterministic.
+    game_exe_filename: String,
     content_id: String,
     offer: Option<OwnedOffer>,
     mode: LaunchMode,
@@ -126,6 +136,7 @@ impl ActiveGameContext {
     pub fn new(
         launch_id: &str,
         game_path: &str,
+        game_exe_filename: &str,
         cloud_saves: bool,
         content_id: &str,
         offer: Option<OwnedOffer>,
@@ -135,6 +146,7 @@ impl ActiveGameContext {
         Self {
             launch_id: launch_id.to_owned(),
             game_path: game_path.to_owned(),
+            game_exe_filename: game_exe_filename.to_owned(),
             content_id: content_id.to_owned(),
             offer,
             mode,
@@ -227,6 +239,17 @@ pub async fn start_game(
     };
 
     let dir = path.safe_parent()?.safe_str()?;
+    // MAXIMA-LINUX-PORT-MOD: capture the .exe filename BEFORE `path` is
+    // shadowed below. This name (e.g. starwarsbattlefrontii.exe) is what
+    // wine-helper.exe needs to look up the game's Wine PID. Walking
+    // /proc/<pid>/cmdline of the MXLaunchId-tagged Linux process is racy:
+    // umu-run re-execs through python3 / bwrap / proton and by the time
+    // LSX connects the original .exe path may already be gone from argv.
+    let game_exe_filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_owned();
     #[cfg(unix)]
     let path = case_insensitive_path(path.clone());
     let path = path.safe_str()?;
@@ -316,13 +339,17 @@ pub async fn start_game(
         .env("MXLaunchId", launch_id.to_owned())
         .env("EAAuthCode", "unavailable")
         .env("EAEgsProxyIpcPort", "0")
-        .env("EAEntitlementSource", "EA")
-        .env("EAExternalSource", "EA")
+        // MAXIMA-LINUX-PORT-MOD: read entitlement source from env so the
+        // Launcher's in-process FFI path can override to STEAM via set_var().
+        .env("EAEntitlementSource", std::env::var("EAEntitlementSource").unwrap_or_else(|_| "EA".to_string()))
+        .env("EAExternalSource", std::env::var("EAExternalSource").unwrap_or_else(|_| "EA".to_string()))
         .env("EAFreeTrialGame", "false")
-        .env("EAGameLocale", maxima.locale.full_str())
+        // MAXIMA-LINUX-PORT-MOD: read game locale from env so the FFI path
+        // can override to en_US (German system locale causes entitlement error).
+        .env("EAGameLocale", std::env::var("EAGameLocale").unwrap_or_else(|_| maxima.locale.full_str().to_string()))
         .env("EAGenericAuthToken", access_token.to_owned())
         .env("EALaunchCode", "unavailable")
-        .env("EALaunchOwner", "EA")
+        .env("EALaunchOwner", std::env::var("EALaunchOwner").unwrap_or_else(|_| "EA".to_string()))
         .env(
             "EALaunchEAID",
             user.player()
@@ -368,6 +395,7 @@ pub async fn start_game(
     maxima.playing = Some(ActiveGameContext::new(
         &launch_id,
         dir,
+        &game_exe_filename,
         options.cloud_saves,
         &content_id,
         offer,

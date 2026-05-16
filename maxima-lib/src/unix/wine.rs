@@ -261,6 +261,13 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         .env("UMU_ZENITY", "1")
         .env("WINEDEBUG", "fixme-all")
         .env("LD_PRELOAD", "") // Fixes some log errors for some games
+        // MAXIMA-LINUX-PORT-MOD: force en-US so Wine's prefix initialisation
+        // writes Locale=00000409 instead of reading $LANG (e.g. de_DE → 00000407).
+        // Both LANG and LC_ALL are set: Wine reads LANG for GetUserDefaultLCID()
+        // during prefix init; LC_ALL covers glibc-level locale calls inside
+        // pressure-vessel.
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
         .arg(arg);
 
     if !wine_path.ends_with("umu-run") {
@@ -376,61 +383,155 @@ fn extract_archive<R: Read + Sized>(
     Ok(())
 }
 
+/// Sets up the Wine prefix registry entries that EA / Origin / BF2 require
+/// before launch.
+///
+/// Originally this wrote a `.reg` file and invoked `regedit` once. That
+/// approach was unreliable on Linux because:
+///   1. `regedit` started inside the umu pressure-vessel container did not
+///      always run protonfixes, leaving the Origin Games keys partially
+///      configured.
+///   2. The `.reg` import did not honour the WoW6432Node redirector, so
+///      32-bit Origin clients could not find the `Origin Games\1035052`
+///      key (BF2's catalog ID).
+///   3. Without a `Locale` value under that key, `GetUserDefaultLCID()`
+///      reported the host's locale (e.g. `de_DE`) and BF2's entitlement
+///      check aborted launch with "The title is installed in a language
+///      that you are not entitled to play".
+///
+/// Each `reg add` invocation is routed through the same wine command
+/// runner used for the actual game launch, so it inherits umu-run +
+/// protonfixes and writes into the shared Wine prefix.
 pub async fn setup_wine_registry() -> Result<(), NativeError> {
-    let mut reg_content = "Windows Registry Editor Version 5.00\n\n".to_string();
-    // This supports text values only at the moment
-    // if you need a dword - implement it
-    let entries: &[(&str, &[(&str, &str)])] = &[
+    // (key, value-name, value-data, [/reg:32 | /reg:64])
+    type RegEntry = (&'static str, &'static str, &'static str, &'static str);
+    const ENTRIES: &[RegEntry] = &[
         (
-            "HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\EA Desktop",
-            &[("InstallSuccessful", "true")],
+            r"HKLM\Software\Electronic Arts\EA Desktop",
+            "InstallSuccessful",
+            "true",
+            "/reg:64",
         ),
         (
-            "HKEY_LOCAL_MACHINE\\Software\\Electronic Arts\\Origin",
-            &[
-                ("InstallSuccessful", "true"),
-                ("ClientPath", "C:/Windows/System32/conhost.exe"),
-            ],
+            r"HKLM\Software\Origin",
+            "ClientPath",
+            "C:/Windows/System32/conhost.exe",
+            "/reg:32",
         ),
         (
-            "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\EA Desktop",
-            &[("InstallSuccessful", "true")],
+            r"HKLM\Software\Origin",
+            "InstallSuccessful",
+            "true",
+            "/reg:32",
+        ),
+        // BF2 catalog ID 1035052: locale + displayname under Origin Games.
+        // Both /reg:32 and /reg:64 are needed because the game and the
+        // Origin shim disagree on which view they read from.
+        (
+            r"HKLM\Software\Origin Games\1035052",
+            "locale",
+            "en_US",
+            "/reg:32",
         ),
         (
-            "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Electronic Arts\\Origin",
-            &[
-                ("InstallSuccessful", "true"),
-                ("ClientPath", "C:/Windows/System32/conhost.exe"),
-            ],
+            r"HKLM\Software\Origin Games\1035052",
+            "displayname",
+            "STAR WARS Battlefront II",
+            "/reg:32",
+        ),
+        // MAXIMA-LINUX-PORT-MOD: explicitly set the en-US locale values after
+        // Wine's own prefix init (which reads $LANG → de_DE → 00000407).
+        // Must be the LAST entries so they win over any prior value in user.reg.
+        //
+        // Locale / LocaleName: fix GetUserDefaultLCID() and GetUserDefaultLocaleName().
+        // sLanguage: fix GetSystemDefaultUILanguage() which reads this value
+        //   directly (not the numeric Locale field).
+        // WoW6432Node duplicate: BF2 is a 32-bit process. /reg:32 should
+        //   redirect writes to WoW6432Node, but Wine's redirection is not
+        //   perfectly reliable; writing both views guarantees BF2 finds en_US.
+        (
+            r"HKCU\Control Panel\International",
+            "Locale",
+            "00000409",
+            "/reg:64",
+        ),
+        (
+            r"HKCU\Control Panel\International",
+            "LocaleName",
+            "en-US",
+            "/reg:64",
+        ),
+        (
+            r"HKCU\Control Panel\International",
+            "sLanguage",
+            "ENU",
+            "/reg:64",
+        ),
+        (
+            r"HKLM\Software\WoW6432Node\Origin Games\1035052",
+            "locale",
+            "en_US",
+            "/reg:64",
+        ),
+        (
+            r"HKLM\Software\WoW6432Node\Origin Games\1035052",
+            "displayname",
+            "STAR WARS Battlefront II",
+            "/reg:64",
+        ),
+        // MAXIMA-LINUX-PORT-MOD: EASteamProxy reads HKCU\Software\Valve\Steam\language
+        // and passes it as locale=<lang> to BF2 at launch time. On a German system this
+        // key contains "german" (written by Steam or appmanifest_1237950.acf), which
+        // causes the "language not entitled" error even after all International patches.
+        // Must be last so it overwrites any value Steam or Wine wrote earlier.
+        (
+            r"HKCU\Software\Valve\Steam",
+            "language",
+            "english",
+            "/reg:64",
         ),
     ];
 
-    for (key, values) in entries.into_iter() {
-        reg_content.push_str(&format!("[{}]\n", key));
-        for (name, value) in values.into_iter() {
-            let value = value.replace("\\", "\\\\");
-            reg_content.push_str(&format!("\"{}\"=\"{}\"\n\n", name, value));
+    // Best-effort: log every individual failure so a missing locale entry
+    // is debuggable, but don't abort the whole sequence. The BF2 entries
+    // (#4, #5) are the critical ones for the language-entitlement check;
+    // the EA Desktop / Origin entries (#1-#3) are nice-to-have shims.
+    let mut failures: Vec<&str> = Vec::new();
+    for (key, name, data, view) in ENTRIES {
+        // Place /reg:VIEW *before* /f. Some Wine versions of reg.exe accept
+        // the trailing form, others ignore the view selector silently and
+        // write to the wrong hive.
+        let result = run_wine_command(
+            "reg",
+            Some(vec!["add", key, "/v", name, view, "/d", data, "/f"]),
+            None,
+            false,
+            CommandType::Run,
+        )
+        .await;
+
+        if let Err(err) = result {
+            log::error!(
+                "reg add failed for [{}] {}={} ({}): {err}",
+                key,
+                name,
+                data,
+                view,
+            );
+            failures.push(name);
         }
     }
 
-    let path = maxima_dir()?.join("temp").join("wine.reg");
-    tokio::fs::create_dir_all(path.safe_parent()?).await?;
-
-    {
-        let mut reg_file = tokio::fs::File::create(&path).await?;
-        reg_file.write_all(reg_content.as_bytes()).await?;
+    if !failures.is_empty() {
+        log::warn!(
+            "{} of {} Wine registry entries failed: {:?}. \
+             BF2 may abort with the language-entitlement error if the BF2 \
+             catalog (Origin Games\\1035052) entries are missing.",
+            failures.len(),
+            ENTRIES.len(),
+            failures,
+        );
     }
-
-    run_wine_command(
-        "regedit",
-        Some(vec![path.safe_str()?]),
-        None,
-        false,
-        CommandType::Run,
-    )
-    .await?;
-
-    tokio::fs::remove_file(path).await?;
 
     Ok(())
 }

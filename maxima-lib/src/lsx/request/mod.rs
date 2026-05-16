@@ -1,4 +1,6 @@
 pub mod account;
+// MAXIMA-LINUX-PORT-MOD: Issue #2 stub. See CHANGES.md (2026-05-05).
+pub mod achievements;
 pub mod auth;
 pub mod challenge;
 pub mod config;
