@@ -471,9 +471,152 @@ fn verify_protocol_handler(protocol: &str) -> Result<bool, RegistryError> {
     Ok(output.status.success())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+pub fn read_game_path(name: &str) -> Result<PathBuf, RegistryError> {
+    // MAXIMA-LINUX-PORT-MOD: Linux has no EA Games registry to query,
+    // so we resolve the BF2 install via Steam metadata. The slug comes
+    // from the Kyber launcher's `get_game_dir(slug)` FFI call; for now
+    // only Battlefront II is supported.
+    let appid = slug_to_steam_appid(name).ok_or_else(|| {
+        RegistryError::Key(format!(
+            "Unsupported game slug for Linux Steam detection: `{}`",
+            name
+        ))
+    })?;
+
+    for steam_root in steam_root_candidates() {
+        let vdf_path = steam_root
+            .join("steamapps")
+            .join("libraryfolders.vdf");
+        let vdf_text = match fs::read_to_string(&vdf_path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        for library in parse_libraryfolders_vdf(&vdf_text) {
+            let acf_path = library
+                .join("steamapps")
+                .join(format!("appmanifest_{}.acf", appid));
+            let acf_text = match fs::read_to_string(&acf_path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            if let Some(installdir) = parse_appmanifest_acf(&acf_text) {
+                let game_path = library
+                    .join("steamapps")
+                    .join("common")
+                    .join(&installdir);
+                if game_path.exists() {
+                    return Ok(case_insensitive_path(game_path));
+                }
+            }
+        }
+    }
+
+    Err(RegistryError::Key(format!(
+        "No Steam installation found for app id {} (slug `{}`)",
+        appid, name
+    )))
+}
+
+#[cfg(target_os = "macos")]
 pub fn read_game_path(_name: &str) -> Result<PathBuf, RegistryError> {
-    todo!("Cannot read game path on unix");
+    todo!("read_game_path is not implemented on macOS");
+}
+
+#[cfg(target_os = "linux")]
+fn slug_to_steam_appid(slug: &str) -> Option<u32> {
+    let normalized: String = slug
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    match normalized.as_str() {
+        "bf2"
+        | "swbf2"
+        | "starwarsbattlefrontii"
+        | "starwarsbattlefront2"
+        | "starwarsbattlefrontii(2017)" => Some(1237950),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn steam_root_candidates() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    // 1. Manual override.
+    if let Some(custom) = env::var_os("STEAM_LIBRARY_ROOT") {
+        roots.push(PathBuf::from(custom));
+    }
+
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        // 2. Flatpak Steam (com.valvesoftware.Steam).
+        roots.push(
+            home.join(".var/app/com.valvesoftware.Steam/.steam/steam"),
+        );
+        // 3. Native Steam (default).
+        roots.push(home.join(".steam/steam"));
+        // 4. Snap-style or alternate Steam path.
+        roots.push(home.join(".local/share/Steam"));
+    }
+
+    // 5. User-configured external library root mirrored from
+    // linux_setup.rs hardcoded fallback.
+    roots.push(PathBuf::from("/mnt/Games/SteamLibrary"));
+
+    roots
+}
+
+/// Extracts every `"path" "<dir>"` value from a Steam
+/// `libraryfolders.vdf`. Each Steam library has an entry like:
+///
+/// ```text
+/// "libraryfolders"
+/// {
+///     "0"
+///     {
+///         "path"          "/home/user/.steam/steam"
+///         "label"         ""
+///         ...
+///     }
+/// }
+/// ```
+#[cfg(target_os = "linux")]
+fn parse_libraryfolders_vdf(text: &str) -> Vec<PathBuf> {
+    use regex::Regex;
+    lazy_static::lazy_static! {
+        static ref PATH_RE: Regex =
+            Regex::new(r#""path"\s+"((?:[^"\\]|\\.)*)""#).unwrap();
+    }
+    PATH_RE
+        .captures_iter(text)
+        .filter_map(|cap| cap.get(1).map(|m| m.as_str()))
+        .map(|raw| raw.replace("\\\\", "\\"))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Extracts the `installdir` value from a Steam appmanifest .acf file,
+/// e.g. `appmanifest_1237950.acf`.
+#[cfg(target_os = "linux")]
+fn parse_appmanifest_acf(text: &str) -> Option<String> {
+    use regex::Regex;
+    lazy_static::lazy_static! {
+        static ref INSTALLDIR_RE: Regex =
+            Regex::new(r#""installdir"\s+"((?:[^"\\]|\\.)*)""#).unwrap();
+    }
+    INSTALLDIR_RE
+        .captures(text)
+        .and_then(|cap| cap.get(1))
+        .map(|m| m.as_str().replace("\\\\", "\\"))
+}
+
+#[cfg(unix)]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn read_game_path(_name: &str) -> Result<PathBuf, RegistryError> {
+    todo!("Cannot read game path on this unix variant");
 }
 
 #[cfg(target_os = "linux")]
@@ -506,4 +649,98 @@ pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
 #[cfg(unix)]
 pub fn launch_bootstrap() -> Result<(), RegistryError> {
     todo!()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_steam_detection_tests {
+    use super::{
+        parse_appmanifest_acf, parse_libraryfolders_vdf, slug_to_steam_appid,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn slug_maps_battlefront_variants_to_appid() {
+        assert_eq!(slug_to_steam_appid("bf2"), Some(1237950));
+        assert_eq!(slug_to_steam_appid("BF2"), Some(1237950));
+        assert_eq!(slug_to_steam_appid("swbf2"), Some(1237950));
+        assert_eq!(
+            slug_to_steam_appid("STAR WARS Battlefront II"),
+            Some(1237950)
+        );
+        assert_eq!(
+            slug_to_steam_appid("starwarsbattlefront2"),
+            Some(1237950)
+        );
+    }
+
+    #[test]
+    fn slug_rejects_unknown_games() {
+        assert_eq!(slug_to_steam_appid(""), None);
+        assert_eq!(slug_to_steam_appid("apex"), None);
+        assert_eq!(slug_to_steam_appid("battlefield-1"), None);
+    }
+
+    #[test]
+    fn parses_libraryfolders_vdf_with_multiple_entries() {
+        let vdf = r#"
+"libraryfolders"
+{
+    "0"
+    {
+        "path"      "/home/user/.local/share/Steam"
+        "label"     ""
+        "totalsize"     "0"
+    }
+    "1"
+    {
+        "path"      "/mnt/Games/SteamLibrary"
+        "label"     ""
+        "totalsize"     "1000000"
+    }
+}
+"#;
+        let libs = parse_libraryfolders_vdf(vdf);
+        assert_eq!(
+            libs,
+            vec![
+                PathBuf::from("/home/user/.local/share/Steam"),
+                PathBuf::from("/mnt/Games/SteamLibrary"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_libraryfolders_vdf_returns_empty_for_garbage() {
+        let libs = parse_libraryfolders_vdf("not a vdf at all");
+        assert!(libs.is_empty());
+    }
+
+    #[test]
+    fn parses_appmanifest_acf_extracts_installdir() {
+        let acf = r#"
+"AppState"
+{
+    "appid"             "1237950"
+    "name"              "STAR WARS Battlefront II"
+    "installdir"        "STAR WARS Battlefront II"
+    "LastUpdated"       "1700000000"
+}
+"#;
+        assert_eq!(
+            parse_appmanifest_acf(acf),
+            Some("STAR WARS Battlefront II".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_appmanifest_acf_returns_none_when_missing() {
+        let acf = r#"
+"AppState"
+{
+    "appid"     "1237950"
+    "name"      "STAR WARS Battlefront II"
+}
+"#;
+        assert_eq!(parse_appmanifest_acf(acf), None);
+    }
 }

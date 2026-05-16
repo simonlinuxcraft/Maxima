@@ -336,6 +336,15 @@ pub async fn start_game(
 
     child
         .current_dir(PathBuf::from(path).safe_parent()?)
+        // MAXIMA-LINUX-PORT-MOD: explicitly propagate en-US locale to the
+        // bootstrap → umu-run → Proton → BF2 chain. The bootstrap binary
+        // is launched directly via Command::new (not via run_wine_command)
+        // and would otherwise inherit LANG=de_DE from the host launcher,
+        // causing umu to re-init parts of the prefix with German locale
+        // and silently overwrite the locale-critical Wine registry keys
+        // that setup_wine_registry just set.
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
         .env("MXLaunchId", launch_id.to_owned())
         .env("EAAuthCode", "unavailable")
         .env("EAEgsProxyIpcPort", "0")
@@ -389,6 +398,19 @@ pub async fn start_game(
                 .env("EAOnErrorExitRetCode", "1");
         }
     };
+
+    // MAXIMA-LINUX-PORT-MOD: pre-spawn verify is intentionally NOT run here.
+    // The pre-flight verify inside `setup_wine_registry()` (called from
+    // `mx_linux_setup()` at the top of this fn) already established that
+    // the four locale-critical keys hold the expected English values.
+    // License-fetch / cloud-sync between that verify and this spawn point
+    // do not touch Wine registry, so a second 4-key probe (~14s of umu-run
+    // overhead via reg query) is pure waste on the happy path.
+    //
+    // If the language-entitlement error ever returns the recovery path is
+    // to re-introduce a one-key probe of `HKCU\Software\Valve\Steam\language`
+    // here (the only key Steam itself sometimes overwrites between launches)
+    // and conditionally call `lock_locale_just_in_time()` on mismatch.
 
     let child = child.spawn().expect("Failed to start child");
 

@@ -507,13 +507,67 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
             "english",
             "/reg:64",
         ),
+        // MAXIMA-LINUX-PORT-MOD: HKCU\Environment is read by Wine on session
+        // start and propagates as a Win32 process environment variable. Setting
+        // LANG/LC_ALL here means every wine sub-process the bootstrap → umu →
+        // Proton → BF2 chain spawns sees en_US.UTF-8 even if the host process
+        // was started with a German locale. Pressure-vessel filters Linux env
+        // vars (see memory `feedback_kyber_pressure_vessel_env.md`); this
+        // registry path is the documented escape hatch.
+        (
+            r"HKCU\Environment",
+            "LANG",
+            "en_US.UTF-8",
+            "/reg:64",
+        ),
+        (
+            r"HKCU\Environment",
+            "LC_ALL",
+            "en_US.UTF-8",
+            "/reg:64",
+        ),
     ];
 
-    // Best-effort: log every individual failure so a missing locale entry
-    // is debuggable, but don't abort the whole sequence. The BF2 entries
-    // (#4, #5) are the critical ones for the language-entitlement check;
-    // the EA Desktop / Origin entries (#1-#3) are nice-to-have shims.
+    // Critical entries: if any of these fail we abort the whole launch
+    // because BF2 will crash with the language-entitlement error and the
+    // user has no signal as to why. Non-critical entries (#1-#3 above)
+    // continue as warnings.
+    const CRITICAL_KEYS: &[&str] = &[
+        // BF2 catalog Origin Games\1035052
+        "locale",
+        "displayname",
+        // HKCU\Control Panel\International
+        "Locale",
+        "LocaleName",
+        "sLanguage",
+        // HKCU\Software\Valve\Steam
+        "language",
+    ];
+
+    // Pre-flight: skip the expensive 15-reg-add loop entirely if a quick
+    // 4-key verify shows the locale-critical state is already correct.
+    // Each reg.exe spawn round-trips through umu-run + pressure-vessel
+    // (~3s); skipping turns a ~50s warm-launch overhead into ~12s.
+    log::info!(
+        "setup_wine_registry: pre-flight verifying {} critical locale keys...",
+        CRITICAL_KEYS.len()
+    );
+    if verify_locale_is_english().await {
+        log::info!(
+            "setup_wine_registry: all critical locale keys already correct, \
+             skipping {} reg-add entries (saves ~50s of umu-run overhead)",
+            ENTRIES.len()
+        );
+        return Ok(());
+    }
+    log::info!(
+        "setup_wine_registry: pre-flight verify found mismatches — \
+         applying full set of {} reg add entries",
+        ENTRIES.len()
+    );
+
     let mut failures: Vec<&str> = Vec::new();
+    let mut critical_failures: Vec<&str> = Vec::new();
     for (key, name, data, view) in ENTRIES {
         // Place /reg:VIEW *before* /f. Some Wine versions of reg.exe accept
         // the trailing form, others ignore the view selector silently and
@@ -527,30 +581,190 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         )
         .await;
 
-        if let Err(err) = result {
-            log::error!(
-                "reg add failed for [{}] {}={} ({}): {err}",
-                key,
-                name,
-                data,
-                view,
-            );
-            failures.push(name);
+        match result {
+            Ok(_) => {
+                log::debug!("reg add OK: [{}] {}={} ({})", key, name, data, view);
+            }
+            Err(err) => {
+                log::error!(
+                    "reg add FAILED for [{}] {}={} ({}): {err}",
+                    key,
+                    name,
+                    data,
+                    view,
+                );
+                failures.push(name);
+                if CRITICAL_KEYS.contains(name) {
+                    critical_failures.push(name);
+                }
+            }
         }
     }
 
     if !failures.is_empty() {
         log::warn!(
-            "{} of {} Wine registry entries failed: {:?}. \
-             BF2 may abort with the language-entitlement error if the BF2 \
-             catalog (Origin Games\\1035052) entries are missing.",
+            "{}/{} Wine registry entries failed: {:?}. \
+             Non-critical failures continue; critical failures abort below.",
             failures.len(),
             ENTRIES.len(),
             failures,
         );
     }
 
+    if !critical_failures.is_empty() {
+        log::error!(
+            "Aborting launch: {} CRITICAL registry entries failed: {:?}. \
+             BF2 would crash with the language-entitlement error.",
+            critical_failures.len(),
+            critical_failures,
+        );
+        return Err(NativeError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "setup_wine_registry: {} critical entries failed: {:?}",
+                critical_failures.len(),
+                critical_failures,
+            ),
+        )));
+    }
+
+    log::info!("setup_wine_registry: done ({} entries OK)", ENTRIES.len() - failures.len());
     Ok(())
+}
+
+/// Just-in-time re-write of the locale-critical keys, run *immediately*
+/// before the BF2 spawn — after the full `setup_wine_registry()` block
+/// but separated by license/cloud-sync/protonfix activity that may
+/// re-initialise parts of the prefix and clobber Steam-language /
+/// International values.
+///
+/// Subset of `setup_wine_registry` ENTRIES: only the four keys BF2 reads
+/// at entitlement-check time. Idempotent and fast (`reg add /f` overwrites
+/// in place).
+pub async fn lock_locale_just_in_time() -> Result<(), NativeError> {
+    type RegEntry = (&'static str, &'static str, &'static str, &'static str);
+    const CRITICAL: &[RegEntry] = &[
+        (r"HKCU\Control Panel\International", "Locale", "00000409", "/reg:64"),
+        (r"HKCU\Control Panel\International", "LocaleName", "en-US", "/reg:64"),
+        (r"HKCU\Control Panel\International", "sLanguage", "ENU", "/reg:64"),
+        (r"HKCU\Software\Valve\Steam", "language", "english", "/reg:64"),
+    ];
+
+    log::info!(
+        "lock_locale_just_in_time: re-writing {} critical keys before BF2 spawn",
+        CRITICAL.len()
+    );
+
+    let mut failures: Vec<&str> = Vec::new();
+    for (key, name, data, view) in CRITICAL {
+        let result = run_wine_command(
+            "reg",
+            Some(vec!["add", key, "/v", name, view, "/d", data, "/f"]),
+            None,
+            false,
+            CommandType::Run,
+        )
+        .await;
+        if let Err(err) = result {
+            log::error!(
+                "JIT reg add FAILED [{}] {}={} ({}): {err}",
+                key,
+                name,
+                data,
+                view,
+            );
+            failures.push(name);
+        } else {
+            log::debug!("JIT reg add OK: [{}] {}={}", key, name, data);
+        }
+    }
+
+    if !failures.is_empty() {
+        log::warn!(
+            "lock_locale_just_in_time: {}/{} keys failed to re-write: {:?}. \
+             BF2 may abort with the language-entitlement error.",
+            failures.len(),
+            CRITICAL.len(),
+            failures,
+        );
+    } else {
+        log::info!("lock_locale_just_in_time: all {} keys re-written", CRITICAL.len());
+    }
+
+    Ok(())
+}
+
+/// Probe what BF2 would actually see when it queries the locale-critical
+/// keys. Logs the live values of the four most-important keys and warns
+/// if any look German/host-locale-derived. Best-effort: a `reg query`
+/// failure is treated as a missing/wrong key (returns false) rather
+/// than aborting the launch.
+///
+/// Returns `true` only if all four critical keys resolved cleanly and
+/// each value contained the expected English token. Callers use this
+/// as a fast pre-flight to skip the expensive `setup_wine_registry()`
+/// and `lock_locale_just_in_time()` paths when the prefix is already
+/// in the desired state — typically the case on warm launches where
+/// nothing tampered with the registry between sessions. Saves ~50s
+/// per warm launch (15 reg-add calls @ ~3s each via umu-run).
+pub async fn verify_locale_is_english() -> bool {
+    type ProbeKey = (&'static str, &'static str, &'static str);
+    const PROBES: &[ProbeKey] = &[
+        (r"HKCU\Control Panel\International", "Locale", "00000409"),
+        (r"HKCU\Control Panel\International", "LocaleName", "en-US"),
+        (r"HKCU\Control Panel\International", "sLanguage", "ENU"),
+        (r"HKCU\Software\Valve\Steam", "language", "english"),
+    ];
+
+    let mut all_match = true;
+
+    for (key, name, expected) in PROBES {
+        let result = run_wine_command(
+            "reg",
+            Some(vec!["query", key, "/v", name]),
+            None,
+            true,
+            CommandType::Run,
+        )
+        .await;
+
+        match result {
+            Ok(output) => {
+                let line_with_value = output
+                    .lines()
+                    .find(|l| l.contains(name))
+                    .unwrap_or("(not found)");
+                let trimmed = line_with_value.trim();
+                if trimmed.contains(expected) {
+                    log::info!(
+                        "locale verify OK: [{}] {} -> {}",
+                        key,
+                        name,
+                        trimmed,
+                    );
+                } else {
+                    log::warn!(
+                        "locale verify MISMATCH: [{}] {} -> {} (expected to contain '{}')",
+                        key,
+                        name,
+                        trimmed,
+                        expected,
+                    );
+                    all_match = false;
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "locale verify failed for [{}] {}: {err}",
+                    key,
+                    name,
+                );
+                all_match = false;
+            }
+        }
+    }
+
+    all_match
 }
 
 pub type WineRegistry = HashMap<String, String>;
