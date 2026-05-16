@@ -17,6 +17,7 @@ use tokio::sync::{MutexGuard, RwLock};
 use super::{
     request::{
         account::handle_query_entitlements_request,
+        achievements::handle_query_achievements_request,
         auth::handle_auth_code_request,
         challenge::handle_challenge_response,
         config::handle_config_request,
@@ -294,6 +295,8 @@ impl Connection {
 
         let n = match self.stream.read(&mut buffer) {
             Ok(n) if n == 0 => {
+                // MAXIMA-LINUX-PORT-MOD: Diagnostic for LSX disconnect detection
+                warn!("LSX peer closed socket cleanly (FIN received)");
                 return Err(LSXConnectionError::Closed);
             }
             Ok(n) => n,
@@ -302,6 +305,8 @@ impl Connection {
                 if kind == ErrorKind::WouldBlock {
                     return Ok(());
                 }
+                // MAXIMA-LINUX-PORT-MOD: Diagnostic for LSX disconnect detection
+                warn!("LSX read error: kind={:?}", kind);
                 return Err(LSXConnectionError::Internal(kind));
             }
         };
@@ -435,6 +440,7 @@ impl Connection {
             GetVoipStatus handle_voip_status_request,
             ShowIGOWindow handle_show_igo_window_request,
             SetDownloaderUtilization handle_set_downloader_util_request,
+            QueryAchievements handle_query_achievements_request,
         );
 
         Ok(match result {

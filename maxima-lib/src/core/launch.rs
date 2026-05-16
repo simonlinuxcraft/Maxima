@@ -113,6 +113,10 @@ impl LaunchMode {
 pub struct ActiveGameContext {
     launch_id: String,
     game_path: String,
+    /// MAXIMA-LINUX-PORT-MOD: see Kyber/ThirdParty/Maxima copy for rationale.
+    /// .exe filename captured at spawn time so wine_get_pid can use it
+    /// directly instead of racing against process re-execs.
+    game_exe_filename: String,
     content_id: String,
     offer: Option<OwnedOffer>,
     mode: LaunchMode,
@@ -126,6 +130,7 @@ impl ActiveGameContext {
     pub fn new(
         launch_id: &str,
         game_path: &str,
+        game_exe_filename: &str,
         cloud_saves: bool,
         content_id: &str,
         offer: Option<OwnedOffer>,
@@ -135,6 +140,7 @@ impl ActiveGameContext {
         Self {
             launch_id: launch_id.to_owned(),
             game_path: game_path.to_owned(),
+            game_exe_filename: game_exe_filename.to_owned(),
             content_id: content_id.to_owned(),
             offer,
             mode,
@@ -227,6 +233,12 @@ pub async fn start_game(
     };
 
     let dir = path.safe_parent()?.safe_str()?;
+    // MAXIMA-LINUX-PORT-MOD: capture .exe filename before path is shadowed.
+    let game_exe_filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_owned();
     #[cfg(unix)]
     let path = case_insensitive_path(path.clone());
     let path = path.safe_str()?;
@@ -368,6 +380,7 @@ pub async fn start_game(
     maxima.playing = Some(ActiveGameContext::new(
         &launch_id,
         dir,
+        &game_exe_filename,
         options.cloud_saves,
         &content_id,
         offer,

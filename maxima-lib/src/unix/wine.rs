@@ -465,6 +465,44 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
     )
     .await?;
 
+    // BF2 Origin catalog entry (game ID 1035052). Without `Locale = en_US`
+    // here Wine's GetUserDefaultLCID() falls back to the host locale and
+    // BF2 aborts with "The title is installed in a language that you are
+    // not entitled to play".  Both /reg:32 and /reg:64 because the game
+    // and the Origin shim disagree on which view to read.
+    for view in &["/reg:32", "/reg:64"] {
+        for (name, data) in &[
+            ("locale", "en_US"),
+            ("displayname", "STAR WARS Battlefront II"),
+        ] {
+            if let Err(err) = run_wine_command(
+                "reg",
+                Some(vec![
+                    "add",
+                    "HKLM\\Software\\Origin Games\\1035052",
+                    "/v",
+                    name,
+                    "/d",
+                    data,
+                    "/f",
+                    view,
+                ]),
+                None,
+                false,
+                CommandType::Run,
+            )
+            .await
+            {
+                log::error!(
+                    "reg add failed for [Origin Games\\1035052] {}={} ({}): {err}",
+                    name,
+                    data,
+                    view,
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

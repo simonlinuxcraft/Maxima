@@ -464,6 +464,24 @@ impl Maxima {
             _ => (),
         }
 
+        // MAXIMA-LINUX-PORT-MOD: On Linux the `playing.process` we own is
+        // the maxima-bootstrap helper, which exits as soon as it has
+        // spawned the umu/Proton chain. The actual BF2 binary lives
+        // several Wine layers deeper and is untracked here. If we acted
+        // on the bootstrap-exit alone we would mark the game as stopped
+        // the moment LSX disconnects (~1s after inject), even though BF2
+        // is still running. Cross-check via sysinfo: a process whose
+        // MXLaunchId env var matches our launch_id means the game is
+        // still alive — return without flipping playing to None.
+        #[cfg(target_os = "linux")]
+        {
+            let pid =
+                crate::lsx::connection::get_os_pid(playing).unwrap_or(0);
+            if pid != 0 {
+                return;
+            }
+        }
+
         info!("Game stopped");
 
         if let Some(offer) = playing.offer() {
