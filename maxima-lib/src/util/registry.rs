@@ -473,10 +473,8 @@ fn verify_protocol_handler(protocol: &str) -> Result<bool, RegistryError> {
 
 #[cfg(target_os = "linux")]
 pub fn read_game_path(name: &str) -> Result<PathBuf, RegistryError> {
-    // MAXIMA-LINUX-PORT-MOD: Linux has no EA Games registry to query,
-    // so we resolve the BF2 install via Steam metadata. The slug comes
-    // from the Kyber launcher's `get_game_dir(slug)` FFI call; for now
-    // only Battlefront II is supported.
+    // No EA Games registry on Linux. Resolve the install via Steam
+    // metadata instead. Only BF2 supported for now.
     let appid = slug_to_steam_appid(name).ok_or_else(|| {
         RegistryError::Key(format!(
             "Unsupported game slug for Linux Steam detection: `{}`",
@@ -621,10 +619,9 @@ pub fn read_game_path(_name: &str) -> Result<PathBuf, RegistryError> {
 
 #[cfg(target_os = "linux")]
 pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
-    // MAXIMA-LINUX-PORT-MOD: when running as the Launcher FFI (kyber_launcher
-    // in bundle/), /proc/self/exe points to bundle/ — bootstrap lives in
-    // bundle/cli/. When running as the CLI (kyber_cli in bundle/cli/),
-    // /proc/self/exe points to bundle/cli/ — bootstrap is right next to it.
+    // Launcher FFI (kyber_launcher in bundle/) points /proc/self/exe at
+    // bundle/, bootstrap sits in bundle/cli/. CLI (kyber_cli in
+    // bundle/cli/) has bootstrap right next to it.
     let exe = module_path()?;
     let base = exe.safe_parent()?;
     let cli_subdir = base.join("cli").join("maxima-bootstrap");
