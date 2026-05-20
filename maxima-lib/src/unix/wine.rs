@@ -284,6 +284,22 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         );
     }
 
+    // MAXIMA-LINUX-PORT-MOD: opt-in workaround for the
+    // `winegstreamer_create_color_converter` Wine abort in GE-Proton 10.x
+    // triggered by EA App's embedded browser on systems without complete
+    // system GStreamer plugins. Users hit by the abort can set
+    // KYBER_DISABLE_WINEGSTREAMER=1 to disable winegstreamer.dll inside
+    // the Proton prefix. The EA App login splash video stays silent but
+    // the launch flow completes. PROTON_DLL_OVERRIDES is the umu/Proton
+    // friendly variant that gets merged with the Proton built-in
+    // overrides rather than replacing them.
+    if env::var("KYBER_DISABLE_WINEGSTREAMER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        child = child.env("PROTON_DLL_OVERRIDES", "winegstreamer=d");
+    }
+
     if let Some(arguments) = args {
         child = child.args(arguments);
     }
@@ -308,14 +324,23 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         output_str = String::from_utf8_lossy(&output.stdout).to_string();
         status = output.status;
     } else {
-        // MAXIMA-LINUX-PORT-MOD: silence both streams when the caller does
-        // not need stdout — same rationale as the wineconsole/stderr fix above.
-        status = child
+        // MAXIMA-LINUX-PORT-MOD: capture stderr only for failure diagnostics.
+        // Stdout stays null (no useful stdout in the inject path; surfacing
+        // Wine fixme spam on systems where this branch succeeds silently
+        // would only pollute logs). On systems where the helper crashes
+        // (e.g. CachyOS exit 101) the captured stderr is surfaced through
+        // WineError::Command::output below so launcher logs show the real
+        // Wine error instead of an empty string.
+        let output = child
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?
-            .wait()
+            .wait_with_output()
             .await?;
+        status = output.status;
+        if !status.success() {
+            output_str = String::from_utf8_lossy(&output.stderr).to_string();
+        }
     };
 
     if !status.success() {
