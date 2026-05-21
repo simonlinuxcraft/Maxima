@@ -91,6 +91,16 @@ pub fn umu_bin() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/umu/umu-run"))
 }
 
+// MAXIMA-LINUX-PORT-MOD: true if feral `gamemoderun` is on PATH. Used to opt
+// the game launch into gamemode only when the user actually has it installed.
+fn gamemoderun_in_path() -> bool {
+    env::var_os("PATH")
+        .map(|paths| {
+            env::split_paths(&paths).any(|p| p.join("gamemoderun").is_file())
+        })
+        .unwrap_or(false)
+}
+
 fn versions() -> Result<Versions, NativeError> {
     let file = maxima_dir()?.join(VERSION_FILE);
     if !file.exists() {
@@ -249,8 +259,28 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     let wine_path =
         env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| umu_bin.to_string_lossy().to_string());
 
+    // MAXIMA-LINUX-PORT-MOD: wrap the actual game launch in `gamemoderun`
+    // when feral gamemode is installed. Only WaitForExitAndRun is the game
+    // (reg.exe/DIP/inject use Run/RunInPrefix), so scoping it to the game
+    // process keeps gamemode tied to the match lifetime instead of leaking
+    // into the long-lived launcher. KYBER_DISABLE_GAMEMODE=1 opts out.
+    // The LD_PRELOAD="" set in the env chain below lands on gamemoderun,
+    // which then adds only libgamemodeauto.so before exec'ing umu-run, so
+    // umu-run still sees no inherited host preloads, just gamemode's own.
+    let use_gamemode = matches!(command_type, CommandType::WaitForExitAndRun)
+        && !env::var("KYBER_DISABLE_GAMEMODE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        && gamemoderun_in_path();
+
     // Create command with all necessary wine env variables
-    let mut binding = Command::new(wine_path.clone());
+    let mut binding = if use_gamemode {
+        let mut c = Command::new("gamemoderun");
+        c.arg(&wine_path);
+        c
+    } else {
+        Command::new(wine_path.clone())
+    };
     // MAXIMA-LINUX-PORT-MOD: detach stdin so Wine does not spawn a
     // wineconsole for console-subsystem helpers like wine-helper.exe.
     // Wine treats an inherited terminal-stdin as "interactive user
