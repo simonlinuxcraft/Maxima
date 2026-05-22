@@ -208,7 +208,8 @@ pub async fn start_game(
                 None => return Err(LaunchError::NoOfferFound(offer_id.clone())),
             };
 
-            if !offer.is_installed().await {
+            // an explicit path override bypasses install detection
+            if options.path_override.is_none() && !offer.is_installed().await {
                 return Err(LaunchError::NotInstalled(offer.offer_id().clone()));
             }
 
