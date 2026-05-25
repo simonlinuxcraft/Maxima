@@ -4,7 +4,8 @@ use std::{
     ffi::OsStr,
     fs::{create_dir_all, remove_dir_all, remove_file, File},
     io::Read,
-    path::PathBuf,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
 };
 
@@ -30,6 +31,24 @@ use crate::util::{
 
 lazy_static! {
     static ref PROTON_PATTERN: Regex = Regex::new(r"GE-Proton\d+-\d+\.tar\.gz").unwrap();
+    // MAXIMA-LINUX-PORT-MOD 2026-05-24: cache last logged proton choice so
+    // that proton_dir() (called 4-5x per game launch) does not spam the log
+    // with identical lines. Logs once per unique resolution, including after
+    // a hot-switch from the launcher UI.
+    static ref LAST_PROTON_LOG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-05-24: emit a single info! line whenever the
+// effective PROTONPATH changes (after launcher start or after a custom path
+// switch). Idempotent across repeated proton_dir() calls.
+fn log_proton_choice(label: &str, path: &Path) {
+    let new = format!("{}|{}", label, path.display());
+    if let Ok(mut last) = LAST_PROTON_LOG.lock() {
+        if last.as_deref() != Some(&new) {
+            info!("[custom-proton] {} = {}", label, path.display());
+            *last = Some(new);
+        }
+    }
 }
 
 // A Proton verb to use
@@ -70,13 +89,242 @@ struct Versions {
     umu: String,
 }
 
-/// Returns internal prtoton pfx path
-pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
+/// Returns the auto-managed default wineprefix path. Kept as a separate
+/// helper (introduced 2026-05-26) so future routing changes can distinguish
+/// the canonical Maxima-managed path from whatever `wine_prefix_dir()`
+/// returns at runtime.
+pub fn default_wine_prefix_dir() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/prefix"))
 }
 
-pub fn proton_dir() -> Result<PathBuf, NativeError> {
+/// Returns internal proton pfx path. Under Option H (the active
+/// custom-proton routing strategy), the wineprefix is ALWAYS the default
+/// Steam-compatdata-linked one even when a custom Proton is active: the
+/// custom-proton swap happens at the `wine/proton` symlink level, not at
+/// the prefix level. Keeps Origin / EA Desktop state shared, avoids the
+/// pressure-vessel wineserver split that broke per-Proton-prefix routing.
+pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
+    default_wine_prefix_dir()
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-05-24: helper that always returns the default
+// auto-managed proton path, regardless of KYBER_PROTON_PATH/sidecar override.
+// Used by extract_wine() / install_wine() so that auto-download keeps writing
+// to the maxima-owned directory even when the user has set a custom override,
+// preventing the user's external proton install from being deleted.
+pub fn default_proton_dir() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/proton"))
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-05-24: layout check for a candidate proton dir.
+// umu-run accepts several upstream layouts: GE-Proton ships `files/bin/wine64`,
+// stock Valve ships `dist/bin/wine64`, some Lutris/Heroic builds ship a flat
+// `bin/wine64`. Top-level `proton` script is also accepted because that's what
+// the umu protocol officially looks for. Permission bit check guards against
+// archives extracted with `--no-same-permissions` (Bug-Hunter #13).
+//
+// MAXIMA-LINUX-PORT-MOD 2026-05-25: also accept the Wine-10 WoW64 single-binary
+// layout where only `wine` (no `wine64`) exists. proton-cachyos 11.0 and
+// upcoming GE-Proton 11+ ship this layout because Wine 10 merged 32/64-bit
+// into one multilib binary.
+fn is_executable_file(p: &Path) -> bool {
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+pub fn is_valid_proton_layout(p: &Path) -> bool {
+    if !p.is_dir() {
+        return false;
+    }
+    p.join("proton").exists()
+        || is_executable_file(&p.join("files/bin/wine64"))
+        || is_executable_file(&p.join("dist/bin/wine64"))
+        || is_executable_file(&p.join("bin/wine64"))
+        || is_executable_file(&p.join("files/bin/wine"))
+        || is_executable_file(&p.join("dist/bin/wine"))
+        || is_executable_file(&p.join("bin/wine"))
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-05-24: resolve a user-supplied custom proton
+// path. Resolution order:
+//   1. KYBER_PROTON_PATH env-var (power-user override, takes precedence)
+//   2. ~/.local/share/maxima/custom_proton_path sidecar file (UI setting,
+//      written by the launcher via the set_custom_proton_path FFI)
+//   3. None - fall through to default auto-managed path
+// Tilde expansion is done in-house (no shellexpand dep needed).
+fn resolve_custom_proton_path() -> Option<PathBuf> {
+    if let Ok(val) = env::var("KYBER_PROTON_PATH") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(expand_tilde(trimmed));
+        }
+    }
+    let sidecar = maxima_dir().ok()?.join("custom_proton_path");
+    if sidecar.exists() {
+        if let Ok(content) = std::fs::read_to_string(&sidecar) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some(expand_tilde(trimmed));
+            }
+        }
+    }
+    None
+}
+
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if s == "~" {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(s)
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-05-26: Option H. proton_dir() now always returns
+// the stable Maxima-default path. Custom-Proton routing happens at the
+// filesystem level via ensure_proton_routing() which makes wine/proton itself
+// a symlink to the user-chosen Proton install. Keeping PROTONPATH stable
+// means Proton's config_info inside the Steam compatdata never sees a path
+// change and never triggers a prefix re-init (Mode B fix).
+//
+// Callers MUST invoke ensure_proton_routing() before reading proton_dir() to
+// guarantee the wine/proton symlink (or backup-restored real dir) is in the
+// state implied by the current sidecar. Invalid custom paths surface from
+// ensure_proton_routing() (NativeError::Wine::CustomProtonInvalid), not from
+// proton_dir() itself.
+pub fn proton_dir() -> Result<PathBuf, NativeError> {
+    let default = default_proton_dir()?;
+    log_proton_choice(
+        if resolve_custom_proton_path().is_some() { "custom-symlink" } else { "default" },
+        &default,
+    );
+    Ok(default)
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-05-26: Option H state machine for the
+// wine/proton mount point.
+//
+// 4 valid filesystem states for wine/proton + wine/proton.maxima-backup:
+//
+//   A: proton = real maxima-managed dir,    backup = absent     [DEFAULT mode]
+//   B: proton = symlink to <custom-path>,   backup = real dir   [CUSTOM mode]
+//   C: proton = absent,                     backup = absent     [INITIAL pre-install]
+//   D: proton = absent,                     backup = real dir   [INCONSISTENT after crash]
+//
+// State A is reached when sidecar is empty.
+// State B is reached when sidecar is set to a valid custom-Proton path.
+// State C is the fresh-install case before Maxima has run install_wine.
+// State D is the failure mode: we crashed mid-swap. ensure_proton_routing()
+// detects and heals it.
+//
+// Idempotent: safe to call from init_app, start_game, set_custom_proton_path
+// FFI without worrying about state accumulation.
+pub fn ensure_proton_routing() -> Result<(), NativeError> {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let proton = default_proton_dir()?;
+    let backup = proton.with_extension("maxima-backup");
+
+    match resolve_custom_proton_path() {
+        Some(custom) => {
+            if !is_valid_proton_layout(&custom) {
+                warn!(
+                    "[ensure_proton_routing] custom proton path invalid: {}",
+                    custom.display()
+                );
+                return Err(NativeError::Wine(WineError::CustomProtonInvalid(custom)));
+            }
+            // Target state: proton -> symlink to custom, backup = real dir.
+
+            // Step 1: ensure backup contains the original Maxima-managed dir
+            // (if proton today is a real dir, move it aside; if proton is
+            // already a symlink, backup should already exist from a previous
+            // switch; if backup is missing in that case, log a warning but
+            // continue - the user must have manually deleted the backup, the
+            // best we can offer is restoring via install_wine on next reset).
+            if let Ok(meta) = fs::symlink_metadata(&proton) {
+                if !meta.file_type().is_symlink() && meta.is_dir() {
+                    if backup.exists() {
+                        warn!(
+                            "[ensure_proton_routing] proton is a real dir AND \
+                             backup already exists at {}. Refusing to clobber; \
+                             investigate manually.",
+                            backup.display()
+                        );
+                        return Err(NativeError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "wine/proton is a directory and wine/proton.maxima-backup also \
+                                 exists; refusing to overwrite. Move one of them aside manually."
+                            ),
+                        )));
+                    }
+                    info!(
+                        "[ensure_proton_routing] moving Maxima-managed proton aside to {}",
+                        backup.display()
+                    );
+                    fs::rename(&proton, &backup)?;
+                }
+            }
+
+            // Step 2: replace whatever is at `proton` (nothing, wrong symlink)
+            // with a symlink pointing to the custom Proton install.
+            if let Ok(meta) = fs::symlink_metadata(&proton) {
+                if meta.file_type().is_symlink() {
+                    match fs::read_link(&proton) {
+                        Ok(target) if target == custom => {
+                            // already correct - nothing to do
+                            return Ok(());
+                        }
+                        _ => {
+                            fs::remove_file(&proton)?;
+                        }
+                    }
+                }
+            }
+            info!(
+                "[ensure_proton_routing] symlinking wine/proton -> {}",
+                custom.display()
+            );
+            symlink(&custom, &proton)?;
+            Ok(())
+        }
+        None => {
+            // Target state: proton = real maxima-managed dir, backup = absent.
+
+            // Step 1: if proton is a symlink, remove it (will be replaced by
+            // backup-restore or by install_wine).
+            if let Ok(meta) = fs::symlink_metadata(&proton) {
+                if meta.file_type().is_symlink() {
+                    info!(
+                        "[ensure_proton_routing] removing custom-proton symlink at wine/proton"
+                    );
+                    fs::remove_file(&proton)?;
+                }
+            }
+
+            // Step 2: if backup exists and proton no longer exists, restore.
+            if backup.exists() && !proton.exists() {
+                info!(
+                    "[ensure_proton_routing] restoring Maxima-managed proton from {}",
+                    backup.display()
+                );
+                fs::rename(&backup, &proton)?;
+            }
+
+            // Step 3: if neither proton nor backup exist (state C: fresh
+            // install) or proton is a real dir already (state A), do nothing
+            // - install_wine will populate / it is already correct.
+            Ok(())
+        }
+    }
 }
 
 pub fn wine_dir() -> Result<PathBuf, NativeError> {
@@ -118,6 +366,16 @@ fn set_versions(versions: Versions) -> Result<(), NativeError> {
 }
 
 pub(crate) async fn check_wine_validity() -> Result<bool, NativeError> {
+    // MAXIMA-LINUX-PORT-MOD 2026-05-24: when a custom proton override is
+    // active, skip the version comparison against GE-Proton's GitHub release
+    // entirely. The user has opted out of auto-management, so neither
+    // dependency-versions.toml nor the upstream release tag are relevant.
+    // Layout check has already happened inside proton_dir() (returns Err if
+    // invalid), so reaching this point means the path is good.
+    if resolve_custom_proton_path().is_some() {
+        return Ok(proton_dir().is_ok());
+    }
+
     if !proton_dir()?.exists() {
         return Ok(false);
     }
@@ -384,6 +642,21 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
 }
 
 pub(crate) async fn install_wine() -> Result<(), NativeError> {
+    // MAXIMA-LINUX-PORT-MOD 2026-05-24: skip auto-download entirely when the
+    // user has set a custom proton path. The default-managed directory in
+    // ~/.local/share/maxima/wine/proton is intentionally left untouched as a
+    // recovery fallback (user can clear the override and get back to a
+    // working default without a re-download).
+    if let Some(custom) = resolve_custom_proton_path() {
+        if is_valid_proton_layout(&custom) {
+            info!("Using custom proton at {:?}, skipping GE-Proton download", custom);
+            return Ok(());
+        }
+        // Invalid custom path: surface as hard error rather than silently
+        // pulling 600MB from GitHub behind the user's back.
+        return Err(NativeError::Wine(WineError::CustomProtonInvalid(custom)));
+    }
+
     let release = get_wine_release()?;
     let asset = match release
         .assets
@@ -417,7 +690,13 @@ pub(crate) async fn install_wine() -> Result<(), NativeError> {
 fn extract_wine(archive_path: &PathBuf) -> Result<(), NativeError> {
     info!("Extracting proton...");
 
-    let dir = proton_dir()?;
+    // MAXIMA-LINUX-PORT-MOD 2026-05-24: always extract into the default
+    // auto-managed path, NEVER into a user-supplied custom path. Without
+    // this, install_wine would wipe the user's external proton install via
+    // the remove_dir_all() below (Bug-Hunter #7). install_wine() already
+    // early-returns when custom is active, but extract_wine is defense-in-
+    // depth in case extract_wine is ever called directly.
+    let dir = default_proton_dir()?;
     if dir.exists() {
         remove_dir_all(&dir)?;
     }
@@ -863,10 +1142,26 @@ async fn parse_wine_registry(file_path: &str) -> WineRegistry {
 }
 
 pub async fn parse_mx_wine_registry() -> Result<WineRegistry, NativeError> {
-    let path = wine_prefix_dir()?.join("system.reg");
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
+    // MAXIMA-LINUX-PORT-MOD 2026-05-26: when a custom Proton is active and the
+    // per-Proton wineprefix has not been initialised yet (first launch, no
+    // system.reg yet), fall back to the default prefix's system.reg. The
+    // registry entries we look up here (BF2 install path, EA Games catalog,
+    // EA Desktop install state) are environment-level facts seeded by Steam
+    // into the default Steam-compatdata-linked prefix and apply identically
+    // regardless of which Proton runs the game. Without this fallback,
+    // is_installed() returns false on the first launch with a fresh custom
+    // prefix and the launcher shows "Game not installed".
+    let primary_path = wine_prefix_dir()?.join("system.reg");
+    let path = if primary_path.exists() {
+        primary_path
+    } else {
+        let fallback = default_wine_prefix_dir()?.join("system.reg");
+        if fallback.exists() {
+            fallback
+        } else {
+            return Ok(HashMap::new());
+        }
+    };
 
     Ok(parse_wine_registry(path.safe_str()?).await)
 }

@@ -58,6 +58,13 @@ pub enum WineError {
     UnimplementedRuntime(String),
     #[error("couldn't find suitable wine release")]
     Fetch,
+    // MAXIMA-LINUX-PORT-MOD 2026-05-24: hard-error when the user has set a
+    // custom proton path (via KYBER_PROTON_PATH or the sidecar file) but it
+    // points to an invalid layout (no wine64 executable). Surfaced to the
+    // launcher UI so the user can fix or reset the path rather than
+    // triggering a silent 600MB GE-Proton fallback download.
+    #[error("custom proton path `{0:?}` is invalid (no wine64 found)")]
+    CustomProtonInvalid(PathBuf),
 }
 pub trait SafeParent {
     fn safe_parent(&self) -> Result<&Path, NativeError>;
