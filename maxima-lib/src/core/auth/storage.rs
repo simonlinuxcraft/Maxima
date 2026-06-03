@@ -71,6 +71,8 @@ pub enum AuthError {
     Query,
     #[error("invalid redirect or chain `{0:?}`")]
     InvalidRedirect(Option<String>),
+    #[error("login timed out waiting for the browser sign-in. Set a native (non-sandboxed) default browser or sign in to the EA app first.")]
+    LoginTimeout,
 }
 
 #[derive(Default, Serialize, Deserialize)]

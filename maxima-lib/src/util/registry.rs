@@ -430,6 +430,14 @@ pub fn check_registry_validity() -> Result<(), RegistryError> {
         return Ok(());
     }
 
+    // Packaged builds register the qrc handler via the installer (under a
+    // distro-specific .desktop name), so the in-app check would always fail
+    // the hardcoded-name compare and trigger a no-op re-registration each
+    // start. Trust the installer when packaged.
+    if env::var("MAXIMA_PACKAGED").is_ok_and(|var| var == "1") {
+        return Ok(());
+    }
+
     if !verify_protocol_handler("qrc")? {
         return Err(RegistryError::QrcUnregistered);
     }

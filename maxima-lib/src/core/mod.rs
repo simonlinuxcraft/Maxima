@@ -459,10 +459,14 @@ impl Maxima {
         }
 
         let playing = self.playing.as_mut().unwrap();
-        match playing.process_mut().try_wait() {
+        let bootstrap_exit = match playing.process_mut().try_wait() {
             Ok(None) => return,
-            _ => (),
-        }
+            Ok(Some(status)) => Some(status),
+            Err(err) => {
+                warn!("Failed to poll bootstrap exit status: {}", err);
+                None
+            }
+        };
 
         // MAXIMA-LINUX-PORT-MOD: On Linux the `playing.process` we own is
         // the maxima-bootstrap helper, which exits as soon as it has
@@ -482,7 +486,10 @@ impl Maxima {
             }
         }
 
-        info!("Game stopped");
+        match bootstrap_exit {
+            Some(status) => info!("Game stopped (bootstrap helper exit: {})", status),
+            None => info!("Game stopped"),
+        }
 
         if let Some(offer) = playing.offer() {
             if *playing.cloud_saves() && offer.offer().has_cloud_save() {

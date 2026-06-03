@@ -12,41 +12,56 @@ lazy_static! {
         Regex::new(r"^([A-Za-z]+) +(.*) +(HTTP/[0-9][.][0-9])").unwrap();
 }
 
+// Browser sign-in must redirect back to the local /auth listener via the
+// qrc:// scheme handler. A sandboxed default browser (Flatpak/Snap, e.g.
+// Zen) can swallow that callback, leaving the listener waiting forever.
+// Bound the whole wait so a missing callback fails with a clear, actionable
+// error instead of hanging the login. On timeout the listener is dropped,
+// freeing port 31033 for the next attempt.
+const LOGIN_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub async fn begin_oauth_login_flow<'a>(context: &mut AuthContext<'a>) -> Result<(), AuthError> {
     open::that(context.nucleus_auth_url(JUNO_PC_CLIENT_ID, "code")?)?;
     let listener = TcpListener::bind("127.0.0.1:31033").await?;
 
-    loop {
-        let (mut socket, _) = listener.accept().await?;
+    let wait = async {
+        loop {
+            let (mut socket, _) = listener.accept().await?;
 
-        let (read, _) = socket.split();
-        let mut reader = BufReader::new(read);
+            let (read, _) = socket.split();
+            let mut reader = BufReader::new(read);
 
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
 
-        let captures = match HTTP_PATTERN.captures(&line) {
-            Some(cap) => cap,
-            None => continue,
-        };
+            let captures = match HTTP_PATTERN.captures(&line) {
+                Some(cap) => cap,
+                None => continue,
+            };
 
-        let path_and_query = captures.get(2).ok_or(AuthError::Query)?.as_str();
-        if path_and_query.starts_with("/auth") {
-            let query = path_and_query
-                .split_once("?")
-                .map(|(_, qs)| qs.trim())
-                .map(querystring::querify)
-                .ok_or(AuthError::Query)?;
+            let path_and_query = captures.get(2).ok_or(AuthError::Query)?.as_str();
+            if path_and_query.starts_with("/auth") {
+                let query = path_and_query
+                    .split_once("?")
+                    .map(|(_, qs)| qs.trim())
+                    .map(querystring::querify)
+                    .ok_or(AuthError::Query)?;
 
-            for query in query {
-                if query.0 == "code" {
-                    context.set_code(query.1);
-                    return Ok(());
+                for query in query {
+                    if query.0 == "code" {
+                        context.set_code(query.1);
+                        return Ok(());
+                    }
                 }
-            }
 
-            return Err(AuthError::NoAuthCode.into());
+                return Err(AuthError::NoAuthCode.into());
+            }
         }
+    };
+
+    match tokio::time::timeout(LOGIN_CALLBACK_TIMEOUT, wait).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(AuthError::LoginTimeout),
     }
 }
 
