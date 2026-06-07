@@ -36,6 +36,19 @@ lazy_static! {
     // with identical lines. Logs once per unique resolution, including after
     // a hot-switch from the launcher UI.
     static ref LAST_PROTON_LOG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    // MAXIMA-LINUX-PORT-MOD 2026-06-07: matches a system GE-Proton 10.x install
+    // directory (e.g. "GE-Proton10-34"). Only the 10.x series is auto-picked:
+    // it is the same major series as the bundled GE-Proton10-34 and is
+    // inject-compatible, unlike the Wine-10 WoW64 single-binary builds in
+    // GE-Proton 11+/proton-cachyos-11+ which break the injector.
+    static ref GE_PROTON_10_PATTERN: Regex = Regex::new(r"^GE-Proton10-(\d+)$").unwrap();
+    // MAXIMA-LINUX-PORT-MOD 2026-06-07: process-lifetime memo of the system
+    // GE-Proton 10.x auto-detection (a ~30-stat scan) so the multiple
+    // resolve_effective_proton_path() calls per launch don't re-scan. Outer
+    // Option = "computed yet?", inner Option = the detected path (None = none
+    // found / managed proton already present).
+    static ref AUTO_PROTON: std::sync::Mutex<Option<Option<PathBuf>>> =
+        std::sync::Mutex::new(None);
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-05-24: emit a single info! line whenever the
@@ -186,6 +199,112 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+// MAXIMA-LINUX-PORT-MOD 2026-06-07: non-persistent auto-detect of a system
+// GE-Proton 10.x. On a fresh install (no managed proton downloaded yet, no
+// user-set custom path) this lets the launch flow route wine/proton at an
+// already-present GE-Proton 10.x in the Steam compatibilitytools.d dirs and
+// skip the ~516MB GE-Proton download entirely. Deliberately does NOT write the
+// user custom-proton sidecar, so it never shows up as a user choice in the UI;
+// it flows only through resolve_effective_proton_path() into the existing
+// Option H symlink machinery. Falls back to the (resumable) download when no
+// suitable system proton exists, so behaviour is unchanged on distros without
+// a GE-Proton 10.x present.
+fn auto_detect_system_proton() -> Option<PathBuf> {
+    if let Ok(guard) = AUTO_PROTON.lock() {
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
+    }
+    let result = compute_auto_detect_system_proton();
+    if let Ok(mut guard) = AUTO_PROTON.lock() {
+        *guard = Some(result.clone());
+    }
+    result
+}
+
+fn compute_auto_detect_system_proton() -> Option<PathBuf> {
+    // Only auto-route on a fresh install: if a real managed proton directory
+    // already exists (previously downloaded), keep using it and never displace
+    // it. A symlink at the default path (a prior auto-route) does not count as
+    // "real", so warm launches re-confirm the same system proton.
+    if let Ok(default) = default_proton_dir() {
+        if let Ok(meta) = std::fs::symlink_metadata(&default) {
+            if !meta.file_type().is_symlink() && meta.is_dir() {
+                return None;
+            }
+        }
+    }
+
+    let home = env::var("HOME").ok()?;
+    let roots = [
+        format!("{}/.local/share/Steam/compatibilitytools.d", home),
+        format!("{}/.steam/steam/compatibilitytools.d", home),
+        format!("{}/.steam/root/compatibilitytools.d", home),
+        format!("{}/.steam/debian-installation/compatibilitytools.d", home),
+        format!(
+            "{}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d",
+            home
+        ),
+        "/usr/share/steam/compatibilitytools.d".to_string(),
+        "/usr/local/share/steam/compatibilitytools.d".to_string(),
+    ];
+
+    // Pick the highest GE-Proton 10.x minor found across all roots.
+    let mut best: Option<(u32, PathBuf)> = None;
+    for root in roots.iter() {
+        let entries = match std::fs::read_dir(root) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let minor = match GE_PROTON_10_PATTERN
+                .captures(&name)
+                .and_then(|c| c.get(1))
+                .and_then(|m| m.as_str().parse::<u32>().ok())
+            {
+                Some(m) => m,
+                None => continue,
+            };
+            if !is_valid_proton_layout(&path) {
+                continue;
+            }
+            if best.as_ref().map(|(m, _)| minor > *m).unwrap_or(true) {
+                best = Some((minor, path));
+            }
+        }
+    }
+
+    match best {
+        Some((minor, path)) => {
+            info!(
+                "[auto-proton] using system GE-Proton10-{} at {} (skipping download)",
+                minor,
+                path.display()
+            );
+            Some(path)
+        }
+        None => None,
+    }
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-06-07: the proton path that should actually drive
+// routing: an explicit user custom path wins, otherwise an auto-detected
+// system GE-Proton 10.x. Used by ensure_proton_routing / check_wine_validity /
+// install_wine so that both override mechanisms share the Option H symlink
+// machinery. resolve_custom_proton_path() (sidecar only) is intentionally left
+// untouched so the launcher UI still reports auto-routing as "not user-set".
+fn resolve_effective_proton_path() -> Option<PathBuf> {
+    resolve_custom_proton_path().or_else(auto_detect_system_proton)
+}
+
 // MAXIMA-LINUX-PORT-MOD 2026-05-26: Option H. proton_dir() now always returns
 // the stable Maxima-default path. Custom-Proton routing happens at the
 // filesystem level via ensure_proton_routing() which makes wine/proton itself
@@ -200,10 +319,14 @@ fn expand_tilde(s: &str) -> PathBuf {
 // proton_dir() itself.
 pub fn proton_dir() -> Result<PathBuf, NativeError> {
     let default = default_proton_dir()?;
-    log_proton_choice(
-        if resolve_custom_proton_path().is_some() { "custom-symlink" } else { "default" },
-        &default,
-    );
+    let label = if resolve_custom_proton_path().is_some() {
+        "custom-symlink"
+    } else if auto_detect_system_proton().is_some() {
+        "auto-symlink"
+    } else {
+        "default"
+    };
+    log_proton_choice(label, &default);
     Ok(default)
 }
 
@@ -232,7 +355,7 @@ pub fn ensure_proton_routing() -> Result<(), NativeError> {
     let proton = default_proton_dir()?;
     let backup = proton.with_extension("maxima-backup");
 
-    match resolve_custom_proton_path() {
+    match resolve_effective_proton_path() {
         Some(custom) => {
             if !is_valid_proton_layout(&custom) {
                 warn!(
@@ -371,8 +494,10 @@ pub(crate) async fn check_wine_validity() -> Result<bool, NativeError> {
     // entirely. The user has opted out of auto-management, so neither
     // dependency-versions.toml nor the upstream release tag are relevant.
     // Layout check has already happened inside proton_dir() (returns Err if
-    // invalid), so reaching this point means the path is good.
-    if resolve_custom_proton_path().is_some() {
+    // invalid), so reaching this point means the path is good. resolve_effective
+    // also covers an auto-detected system GE-Proton 10.x, which is likewise not
+    // version-managed against the GitHub release.
+    if resolve_effective_proton_path().is_some() {
         return Ok(proton_dir().is_ok());
     }
 
@@ -655,6 +780,21 @@ pub(crate) async fn install_wine() -> Result<(), NativeError> {
         // Invalid custom path: surface as hard error rather than silently
         // pulling 600MB from GitHub behind the user's back.
         return Err(NativeError::Wine(WineError::CustomProtonInvalid(custom)));
+    }
+
+    // MAXIMA-LINUX-PORT-MOD 2026-06-07: no user custom path, but a system
+    // GE-Proton 10.x was auto-detected (already layout-validated): route to it
+    // and skip the download. Unlike the user-custom branch this never hard-
+    // errors; if detection ever returns a bad path we simply fall through to
+    // the download below.
+    if let Some(auto) = auto_detect_system_proton() {
+        if is_valid_proton_layout(&auto) {
+            info!(
+                "Using auto-detected system proton at {:?}, skipping GE-Proton download",
+                auto
+            );
+            return Ok(());
+        }
     }
 
     let release = get_wine_release()?;
