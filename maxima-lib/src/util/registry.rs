@@ -549,7 +549,7 @@ fn slug_to_steam_appid(slug: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn steam_root_candidates() -> Vec<PathBuf> {
+pub(crate) fn steam_root_candidates() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
     // 1. Manual override.
@@ -590,7 +590,7 @@ fn steam_root_candidates() -> Vec<PathBuf> {
 /// }
 /// ```
 #[cfg(target_os = "linux")]
-fn parse_libraryfolders_vdf(text: &str) -> Vec<PathBuf> {
+pub(crate) fn parse_libraryfolders_vdf(text: &str) -> Vec<PathBuf> {
     use regex::Regex;
     lazy_static::lazy_static! {
         static ref PATH_RE: Regex =

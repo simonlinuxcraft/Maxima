@@ -484,11 +484,52 @@ impl Maxima {
             if pid != 0 {
                 return;
             }
+            // MAXIMA-LINUX-PORT-MOD: the bootstrap helper exits ~14s in (it only
+            // spawns the umu/Proton chain). BF2 then cold-loads, injects and
+            // opens its LSX connection. Linux env (MXLaunchId) does not survive
+            // pressure-vessel into the BF2 process, so the get_os_pid scan above
+            // can never find it. If the game has not connected via LSX yet
+            // (`started` is false), keep the launch alive through a grace window
+            // instead of declaring it stopped and refocusing the launcher over a
+            // game that is still loading.
+            let started = *playing.started();
+            if !started && playing.launch_grace_remaining() {
+                return;
+            }
         }
 
         match bootstrap_exit {
-            Some(status) => info!("Game stopped (bootstrap helper exit: {})", status),
+            Some(status) => info!(
+                "Game stopped (bootstrap helper exit: {}; exe: {}; launch_id: {})",
+                status,
+                playing.game_exe_filename(),
+                playing.launch_id(),
+            ),
             None => info!("Game stopped"),
+        }
+
+        // MAXIMA-LINUX-PORT-MOD: surface the captured game-launch output
+        // (Proton/Wine) into the launcher log so a fast-fail (stub exits 0,
+        // real game never spawns) is diagnosable from the exported log.txt.
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(path) = crate::unix::wine::game_launch_log_path() {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    let trimmed = contents.trim();
+                    if !trimmed.is_empty() {
+                        let tail = if trimmed.len() > 16_384 {
+                            let mut i = trimmed.len() - 16_384;
+                            while !trimmed.is_char_boundary(i) {
+                                i += 1;
+                            }
+                            &trimmed[i..]
+                        } else {
+                            trimmed
+                        };
+                        warn!("Game launch output (Proton/Wine):\n{}", tail);
+                    }
+                }
+            }
         }
 
         if let Some(offer) = playing.offer() {

@@ -462,6 +462,207 @@ pub fn umu_bin() -> Result<PathBuf, NativeError> {
     Ok(maxima_dir()?.join("wine/umu/umu-run"))
 }
 
+// MAXIMA-LINUX-PORT-MOD (6.4.4): umu installs its Steam Linux Runtime under its
+// own XDG data dir (XDG_DATA_HOME/umu or ~/.local/share/umu), NOT under
+// maxima_dir(). run_wine_command does not override XDG_DATA_HOME for the umu
+// child, so umu inherits the same value this resolves to. Mirror that exact
+// rule so the Deck pre-stage targets the directory umu-run actually reads.
+#[cfg(target_os = "linux")]
+fn umu_steamrt3_dir() -> Option<PathBuf> {
+    let base = if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        PathBuf::from(xdg)
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".local/share")
+    } else {
+        return None;
+    };
+    Some(base.join("umu").join("steamrt3"))
+}
+
+// MAXIMA-LINUX-PORT-MOD (6.4.4): Steam Deck / SteamOS detection, mirrors the
+// signals umu-wrapper.sh already uses (_kyber_is_deck). An explicit Deck signal
+// is required so a normal Arch box (SteamOS 3 is Arch-based) is never matched.
+#[cfg(target_os = "linux")]
+fn is_steam_deck() -> bool {
+    if env::var("SteamDeck").map(|v| v == "1").unwrap_or(false) {
+        return true;
+    }
+    if env::var_os("SteamOS").is_some() {
+        return true;
+    }
+    std::fs::read_to_string("/etc/os-release")
+        .map(|s| s.lines().any(|l| l == "ID=steamos" || l == "ID=\"steamos\""))
+        .unwrap_or(false)
+}
+
+// MAXIMA-LINUX-PORT-MOD (6.4.4): a directory is a usable sniper Steam Linux
+// Runtime if it carries the entry point, the pressure-vessel pv-verify binary
+// (umu's check_runtime runs it against the bundled mtree) and a platform dir.
+#[cfg(target_os = "linux")]
+fn is_valid_sniper_runtime(dir: &Path) -> bool {
+    if !dir.join("_v2-entry-point").is_file() {
+        return false;
+    }
+    if !dir.join("pressure-vessel/bin/pv-verify").is_file() {
+        return false;
+    }
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("sniper_platform_")
+                    && e.path().is_dir()
+            })
+        })
+        .unwrap_or(false)
+}
+
+// MAXIMA-LINUX-PORT-MOD (6.4.4): find Valve's SteamLinuxRuntime_sniper already
+// installed via Steam. Reuses Maxima's existing Steam library resolution so SD
+// cards and Flatpak Steam are covered (libraryfolders.vdf lists every library
+// root). Returns the first valid sniper runtime, or None when Steam never
+// installed it (fresh Deck that has not run a Proton game yet).
+#[cfg(target_os = "linux")]
+fn find_steam_sniper_runtime() -> Option<PathBuf> {
+    use crate::util::registry::{parse_libraryfolders_vdf, steam_root_candidates};
+
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for root in steam_root_candidates() {
+        // Every library root in this Steam's libraryfolders.vdf, plus the root
+        // itself as a fallback when the vdf cannot be read.
+        let vdf = root.join("steamapps/libraryfolders.vdf");
+        let mut libraries = std::fs::read_to_string(&vdf)
+            .map(|t| parse_libraryfolders_vdf(&t))
+            .unwrap_or_default();
+        libraries.push(root.clone());
+
+        for lib in libraries {
+            if seen.contains(&lib) {
+                continue;
+            }
+            seen.push(lib.clone());
+            let cand = lib.join("steamapps/common/SteamLinuxRuntime_sniper");
+            if is_valid_sniper_runtime(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+// MAXIMA-LINUX-PORT-MOD (6.4.4): on the Steam Deck, pre-populate umu's runtime
+// dir from Steam's own SteamLinuxRuntime_sniper so the first game launch does
+// not have umu download the ~300MB Steam Linux Runtime. That download is the
+// Deck launch blocker on slow/unstable links, and UMU_RUNTIME_UPDATE=0 does not
+// prevent it: umu only consults that flag after its install-marker check, so a
+// missing runtime still triggers a full download.
+//
+// Best-effort: any failure logs and returns, leaving umu to download as before
+// (so non-Deck distros and fresh Decks without a Steam sniper stay unchanged).
+// Deliberately does NOT write umu's .installed.ok marker - umu's setup_umu runs
+// pv-verify on the copied tree and writes the marker itself only when it
+// validates, so a partial/mismatched mirror self-heals to the normal download
+// instead of leaving a broken runtime in place.
+#[cfg(target_os = "linux")]
+pub(crate) fn prestage_steam_runtime_on_deck() {
+    if !is_steam_deck() {
+        return;
+    }
+    let dest = match umu_steamrt3_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    // umu already has a runtime here (complete, or a partial .parts download):
+    // never touch a non-empty dir, let umu validate or resume it.
+    if dest.exists() {
+        return;
+    }
+    let src = match find_steam_sniper_runtime() {
+        Some(s) => s,
+        None => {
+            info!("deck SLR pre-stage: no Steam sniper runtime found, umu will download its own");
+            return;
+        }
+    };
+    let parent = match dest.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    if let Err(e) = create_dir_all(parent) {
+        warn!(
+            "deck SLR pre-stage: cannot create {}: {}",
+            parent.display(),
+            e
+        );
+        return;
+    }
+
+    // Stage into a temp sibling on the same filesystem, then atomically rename
+    // into place so an interrupted copy never leaves a half-populated runtime.
+    let staging = parent.join(".steamrt3.kyber-stage");
+    let _ = remove_dir_all(&staging);
+
+    // cp -a preserves the relative `umu -> _v2-entry-point` symlink and all the
+    // pressure-vessel symlinks/permissions a naive recursive copy would mangle.
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(&src)
+        .arg(&staging)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            warn!("deck SLR pre-stage: cp exited {}, leaving umu to download", s);
+            let _ = remove_dir_all(&staging);
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "deck SLR pre-stage: cp failed to start: {}, leaving umu to download",
+                e
+            );
+            let _ = remove_dir_all(&staging);
+            return;
+        }
+    }
+
+    // Steam's sniper dir has no `umu` symlink; umu produces one (umu ->
+    // _v2-entry-point). Add it so the layout matches what umu writes itself.
+    let umu_link = staging.join("umu");
+    if !umu_link.exists() {
+        let _ = std::os::unix::fs::symlink("_v2-entry-point", &umu_link);
+    }
+
+    if let Err(e) = std::fs::rename(&staging, &dest) {
+        warn!(
+            "deck SLR pre-stage: rename into place failed: {}, leaving umu to download",
+            e
+        );
+        let _ = remove_dir_all(&staging);
+        return;
+    }
+    info!(
+        "deck SLR pre-stage: mirrored Steam sniper runtime {} -> {} (umu will pv-verify and mark it)",
+        src.display(),
+        dest.display()
+    );
+}
+
+// The Steam Deck only exists on Linux; on other unix targets (macOS) the Steam
+// library resolver does not compile, so this is a no-op.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prestage_steam_runtime_on_deck() {}
+
+/// MAXIMA-LINUX-PORT-MOD: file that the actual game launch (WaitForExitAndRun)
+/// mirrors its stdout+stderr into when KYBER_GAME_LOG is set. The launcher
+/// reads it on game-stop and forwards it into log.txt so a fast-fail (the BF2
+/// stub exits 0 without spawning the real game) is diagnosable from the
+/// exported logs.
+pub fn game_launch_log_path() -> Result<PathBuf, NativeError> {
+    Ok(maxima_dir()?.join("wine/last-game-launch.log"))
+}
+
 // MAXIMA-LINUX-PORT-MOD: true if feral `gamemoderun` is on PATH. Used to opt
 // the game launch into gamemode only when the user actually has it installed.
 fn gamemoderun_in_path() -> bool {
@@ -642,6 +843,14 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     let wine_path =
         env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| umu_bin.to_string_lossy().to_string());
 
+    // MAXIMA-LINUX-PORT-MOD (6.4.3 diag): helper invocations (reg/inject/DIP)
+    // are expected to finish in seconds. On the Steam Deck each call was
+    // observed to take ~5min; measure and surface that so logs show where the
+    // launch flow stalls. The game itself (WaitForExitAndRun) runs long
+    // legitimately and is excluded below.
+    let arg_log = arg.as_ref().to_string_lossy().into_owned();
+    let call_started = std::time::Instant::now();
+
     // MAXIMA-LINUX-PORT-MOD: wrap the actual game launch in `gamemoderun`
     // when feral gamemode is installed. Only WaitForExitAndRun is the game
     // (reg.exe/DIP/inject use Run/RunInPrefix), so scoping it to the game
@@ -677,7 +886,6 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         .env("PROTONPATH", proton_path)
         .env("STORE", "ea")
         .env("PROTON_EAC_RUNTIME", eac_path)
-        .env("UMU_ZENITY", "1")
         .env("WINEDEBUG", "fixme-all")
         .env("LD_PRELOAD", "") // Fixes some log errors for some games
         // MAXIMA-LINUX-PORT-MOD: force en-US so Wine's prefix initialisation
@@ -713,6 +921,22 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         child = child.env("PROTON_DLL_OVERRIDES", "winegstreamer=d");
     }
 
+    // MAXIMA-LINUX-PORT-MOD (6.4.3): only show umu's zenity progress dialog for
+    // the actual game launch. The locale-setup reg.exe calls and the inject
+    // helper each spawn umu-run too; with UMU_ZENITY on every call they flashed
+    // a "downloading umu runtime" dialog repeatedly (seen 5x on a normal Ubuntu
+    // launch). Scope it to the real launch so only that shows progress.
+    if matches!(command_type, CommandType::WaitForExitAndRun) {
+        child = child.env("UMU_ZENITY", "1");
+    }
+    // MAXIMA-LINUX-PORT-MOD (6.4.3): stop umu re-checking/re-validating its
+    // Steam-Linux-Runtime on every invocation. The runtime installs once; the
+    // repeated update check is what re-popped the dialog (and loops forever on
+    // slow links, the Steam Deck blocker). User-overridable via the env var.
+    if env::var_os("UMU_RUNTIME_UPDATE").is_none() {
+        child = child.env("UMU_RUNTIME_UPDATE", "0");
+    }
+
     if let Some(arguments) = args {
         child = child.args(arguments);
     }
@@ -724,7 +948,29 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     let status: ExitStatus;
     let mut output_str = String::new();
 
-    if want_output {
+    // MAXIMA-LINUX-PORT-MOD: diagnostic capture of the actual game launch.
+    // WaitForExitAndRun normally nulls stdout and only surfaces stderr on a
+    // non-zero exit; the BF2 stub exits 0 even when the real game never spawns,
+    // so the Proton/Wine reason is lost. When KYBER_GAME_LOG is set, mirror
+    // stdout+stderr into a file the launcher reads on game-stop and forwards
+    // into log.txt. Bounded: this call returns when the stub exits (~14s),
+    // not for the whole play session.
+    let game_log = matches!(command_type, CommandType::WaitForExitAndRun)
+        && env::var("KYBER_GAME_LOG")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+
+    if game_log {
+        let path = game_launch_log_path()?;
+        let out = std::fs::File::create(&path)?;
+        let err = out.try_clone()?;
+        status = child
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()?
+            .wait()
+            .await?;
+    } else if want_output {
         let output = child
             .stdout(Stdio::piped())
             // MAXIMA-LINUX-PORT-MOD: silence stderr so Wine/umu fixme spam
@@ -755,6 +1001,18 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             output_str = String::from_utf8_lossy(&output.stderr).to_string();
         }
     };
+
+    let call_secs = call_started.elapsed().as_secs();
+    if !matches!(command_type, CommandType::WaitForExitAndRun) && call_secs > 60 {
+        log::warn!(
+            "wine command '{} {}' took {}s (exit {}) - umu runtime bootstrap, \
+             umu.lock contention or a wineserver hang is likely blocking the launch flow",
+            wine_path,
+            arg_log,
+            call_secs,
+            status,
+        );
+    }
 
     if !status.success() {
         return Err(NativeError::Wine(WineError::Command {
@@ -890,6 +1148,162 @@ fn extract_archive<R: Read + Sized>(
 ///      check aborted launch with "The title is installed in a language
 ///      that you are not entitled to play".
 ///
+// MAXIMA-LINUX-PORT-MOD (6.4.3): file-based pre-flight for the registry
+// setup. The launcher patches user.reg/system.reg directly before every
+// launch (patch_wine_registry_for_bf2 in linux_setup.rs, only when no
+// wineserver is running). When those files already carry every entry that
+// setup_wine_registry would write, the whole reg.exe batch is redundant.
+// Verifying that via `reg query` costs one umu/wine round-trip per key,
+// and on the Steam Deck each of those calls was observed to hang ~5min,
+// which made the launch flow take >90min and never reach the game.
+// Reading the files costs milliseconds and needs no wine at all.
+
+fn wineserver_running() -> bool {
+    std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("wineserver")
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+// Section-aware check for a "Name"="Value" line in Wine .reg file text.
+// Case-insensitive on the section header AND the line: Wine writes 32-bit
+// redirects as Software\\Wow6432Node\\... while the launcher's direct file
+// patch writes Software\\WoW6432Node\\...; both coexist as separate text
+// sections and merge case-insensitively when Wine loads the file. Exact
+// header matching (no substring contains) avoids false hits like
+// [Software\\Origin Games\\...] matching a [Software\\Origin] probe.
+fn reg_file_section_has_value(content: &str, section: &str, name: &str, value: &str) -> bool {
+    let section_lc = section.to_lowercase();
+    let needle_lc = format!("\"{}\"=\"{}\"", name, value).to_lowercase();
+    let mut in_section = false;
+    for line in content.lines() {
+        if line.starts_with('[') {
+            in_section = match line.find(']') {
+                Some(end) => line[1..end].to_lowercase() == section_lc,
+                None => false,
+            };
+            continue;
+        }
+        if in_section && line.trim().to_lowercase() == needle_lc {
+            return true;
+        }
+    }
+    false
+}
+
+// Checks that every entry setup_wine_registry would write is already in
+// user.reg/system.reg. /reg:32 HKLM entries are accepted in either the
+// Wow6432Node view (where a real reg add lands) or the nominal path (where
+// the launcher's file patch writes them) - the point of the check is "the
+// locale/Origin state BF2 needs is present", not which writer put it there.
+fn verify_registry_files_for_bf2() -> bool {
+    let prefix = match wine_prefix_dir() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let user = match std::fs::read_to_string(prefix.join("user.reg")) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let system = match std::fs::read_to_string(prefix.join("system.reg")) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    type FileCheck = (&'static str, &'static [&'static str], &'static str, &'static str);
+    const USER_CHECKS: &[FileCheck] = &[
+        ("user.reg", &[r"Control Panel\\International"], "Locale", "00000409"),
+        ("user.reg", &[r"Control Panel\\International"], "LocaleName", "en-US"),
+        ("user.reg", &[r"Control Panel\\International"], "sLanguage", "ENU"),
+        ("user.reg", &[r"Software\\Valve\\Steam"], "language", "english"),
+        ("user.reg", &[r"Environment"], "LANG", "en_US.UTF-8"),
+        ("user.reg", &[r"Environment"], "LC_ALL", "en_US.UTF-8"),
+    ];
+    const SYSTEM_CHECKS: &[FileCheck] = &[
+        (
+            "system.reg",
+            &[r"Software\\Electronic Arts\\EA Desktop"],
+            "InstallSuccessful",
+            "true",
+        ),
+        (
+            "system.reg",
+            &[r"Software\\Wow6432Node\\Origin", r"Software\\Origin"],
+            "ClientPath",
+            "C:/Windows/System32/conhost.exe",
+        ),
+        (
+            "system.reg",
+            &[r"Software\\Wow6432Node\\Origin", r"Software\\Origin"],
+            "InstallSuccessful",
+            "true",
+        ),
+        (
+            "system.reg",
+            &[
+                r"Software\\Wow6432Node\\Origin Games\\1035052",
+                r"Software\\Origin Games\\1035052",
+            ],
+            "locale",
+            "en_US",
+        ),
+        (
+            "system.reg",
+            &[
+                r"Software\\Wow6432Node\\Origin Games\\1035052",
+                r"Software\\Origin Games\\1035052",
+            ],
+            "displayname",
+            "STAR WARS Battlefront II",
+        ),
+    ];
+
+    for (file, sections, name, value) in USER_CHECKS.iter().chain(SYSTEM_CHECKS.iter()) {
+        let content = if *file == "user.reg" { &user } else { &system };
+        let found = sections
+            .iter()
+            .any(|s| reg_file_section_has_value(content, s, name, value));
+        if !found {
+            log::info!(
+                "registry file pre-flight: {} missing [{}] {}={}",
+                file,
+                sections[0],
+                name,
+                value,
+            );
+            return false;
+        }
+    }
+    true
+}
+
+// JIT subset: only the four keys BF2 reads at entitlement-check time, all
+// in user.reg. Used by lock_locale_just_in_time, where a wineserver is
+// almost always running (the bootstrap started it), so unlike the full
+// pre-flight this one intentionally has no wineserver gate: if the file
+// still shows the locked state, nothing re-initialised the prefix since
+// setup_wine_registry ran and the re-write is redundant.
+fn verify_locale_files_for_bf2() -> bool {
+    let prefix = match wine_prefix_dir() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let user = match std::fs::read_to_string(prefix.join("user.reg")) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    [
+        (r"Control Panel\\International", "Locale", "00000409"),
+        (r"Control Panel\\International", "LocaleName", "en-US"),
+        (r"Control Panel\\International", "sLanguage", "ENU"),
+        (r"Software\\Valve\\Steam", "language", "english"),
+    ]
+    .iter()
+    .all(|(section, name, value)| reg_file_section_has_value(&user, section, name, value))
+}
+
 /// Each `reg add` invocation is routed through the same wine command
 /// runner used for the actual game launch, so it inherits umu-run +
 /// protonfixes and writes into the shared Wine prefix.
@@ -1018,10 +1432,30 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         "language",
     ];
 
+    // MAXIMA-LINUX-PORT-MOD (6.4.3): file-based pre-flight first. When no
+    // wineserver is running, user.reg/system.reg are authoritative (Wine only
+    // diverges from them while a server holds the registry in memory) and the
+    // launcher's direct file patch has already run. If every entry is present,
+    // skip the reg.exe batch without a single wine/umu call - on the Steam
+    // Deck each such call hung ~5min and the 19-call batch blocked the launch
+    // for >90min. With a live wineserver the behaviour below is unchanged.
+    if !wineserver_running() && verify_registry_files_for_bf2() {
+        log::info!(
+            "setup_wine_registry: user.reg/system.reg already contain all {} entries \
+             (file pre-flight, no wineserver) - skipping reg setup entirely",
+            ENTRIES.len()
+        );
+        return Ok(());
+    }
+
     // Pre-flight: skip the expensive 15-reg-add loop entirely if a quick
     // 4-key verify shows the locale-critical state is already correct.
     // Each reg.exe spawn round-trips through umu-run + pressure-vessel
     // (~3s); skipping turns a ~50s warm-launch overhead into ~12s.
+    log::info!(
+        "setup_wine_registry: reg runner = {}",
+        env::var("MAXIMA_WINE_COMMAND").unwrap_or_else(|_| "umu-run (MAXIMA_WINE_COMMAND unset)".into())
+    );
     log::info!(
         "setup_wine_registry: pre-flight verifying {} critical locale keys...",
         CRITICAL_KEYS.len()
@@ -1124,6 +1558,22 @@ pub async fn lock_locale_just_in_time() -> Result<(), NativeError> {
         (r"HKCU\Software\Valve\Steam", "language", "english", "/reg:64"),
     ];
 
+    // MAXIMA-LINUX-PORT-MOD (6.4.3): file pre-flight, deliberately without a
+    // wineserver gate (the bootstrap has one running at this point, so a gate
+    // would never pass). The JIT re-write exists to undo prefix re-inits that
+    // clobber the locale keys between setup_wine_registry and the BF2 spawn;
+    // if user.reg still shows the locked state, no clobber happened and the
+    // re-write is redundant. On the Deck the 4 reg adds would otherwise hang
+    // ~5min each.
+    if verify_locale_files_for_bf2() {
+        log::info!(
+            "lock_locale_just_in_time: user.reg already locked to en-US \
+             (file pre-flight) - skipping {} reg adds",
+            CRITICAL.len()
+        );
+        return Ok(());
+    }
+
     log::info!(
         "lock_locale_just_in_time: re-writing {} critical keys before BF2 spawn",
         CRITICAL.len()
@@ -1204,6 +1654,19 @@ pub async fn verify_locale_is_english() -> bool {
 
         match result {
             Ok(output) => {
+                // Empty stdout with exit 0 means the wine command very likely
+                // never executed (degraded umu run, swallowed bootstrap error)
+                // rather than "key missing" - log it as its own case.
+                if output.trim().is_empty() {
+                    log::warn!(
+                        "locale verify: empty reg query output for [{}] {} - \
+                         the wine command may not have executed; treating as mismatch",
+                        key,
+                        name,
+                    );
+                    all_match = false;
+                    continue;
+                }
                 let line_with_value = output
                     .lines()
                     .find(|l| l.contains(name))

@@ -130,6 +130,10 @@ pub struct ActiveGameContext {
     cloud_saves: bool,
     process: Child,
     started: bool,
+    /// MAXIMA-LINUX-PORT-MOD: timestamp of when the bootstrap helper was first
+    /// observed exited. Used to grace-window the "game stopped" decision while
+    /// BF2 cold-loads, injects and opens its LSX connection (Linux/umu only).
+    first_exit_seen: Option<std::time::Instant>,
 }
 
 impl ActiveGameContext {
@@ -154,6 +158,7 @@ impl ActiveGameContext {
             cloud_saves,
             process,
             started: false,
+            first_exit_seen: None,
         }
     }
 
@@ -163,6 +168,20 @@ impl ActiveGameContext {
 
     pub fn process_mut(&mut self) -> &mut Child {
         &mut self.process
+    }
+
+    /// MAXIMA-LINUX-PORT-MOD: returns true while the post-bootstrap-exit grace
+    /// window is still open. The bootstrap helper exits ~14s in (it only spawns
+    /// the umu/Proton chain); BF2 then cold-loads, injects and opens its LSX
+    /// connection. Until that first connect (`started`) the launcher must not
+    /// declare the game stopped or it refocuses over a still-loading game.
+    /// First call latches the start of the window.
+    #[allow(dead_code)]
+    pub fn launch_grace_remaining(&mut self) -> bool {
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+        let now = std::time::Instant::now();
+        let since = *self.first_exit_seen.get_or_insert(now);
+        now.duration_since(since) < GRACE
     }
 }
 
@@ -347,6 +366,15 @@ pub async fn start_game(
         .env("LANG", "en_US.UTF-8")
         .env("LC_ALL", "en_US.UTF-8")
         .env("MXLaunchId", launch_id.to_owned())
+        // MAXIMA-LINUX-PORT-MOD (6.4.3): forward the game-output diagnostic flag
+        // explicitly so the bootstrap's run_wine_command(WaitForExitAndRun)
+        // captures Proton/Wine output into last-game-launch.log. Default-on for
+        // this build; KYBER_GAME_LOG=0 disables. Relying on env inheritance from
+        // the launcher proved unreliable (the file was never written).
+        .env(
+            "KYBER_GAME_LOG",
+            std::env::var("KYBER_GAME_LOG").unwrap_or_else(|_| "1".to_string()),
+        )
         .env("EAAuthCode", "unavailable")
         .env("EAEgsProxyIpcPort", "0")
         // MAXIMA-LINUX-PORT-MOD: read entitlement source from env so the
@@ -453,7 +481,7 @@ async fn request_opaque_ooa_token(access_token: &str) -> Result<String, AuthErro
 pub async fn mx_linux_setup() -> Result<(), NativeError> {
     use crate::unix::wine::{
         check_runtime_validity, check_wine_validity, get_lutris_runtimes, install_runtime,
-        install_wine, setup_wine_registry,
+        install_wine, prestage_steam_runtime_on_deck, setup_wine_registry,
     };
 
     info!("Verifying wine dependencies...");
@@ -471,6 +499,13 @@ pub async fn mx_linux_setup() -> Result<(), NativeError> {
             install_runtime("umu", &runtimes).await?;
         }
     }
+
+    // MAXIMA-LINUX-PORT-MOD (6.4.4): on the Steam Deck, mirror Steam's existing
+    // SteamLinuxRuntime_sniper into umu's runtime dir so the first game launch
+    // does not stall on umu's own ~300MB runtime download (the Deck launch
+    // blocker on slow links). Best-effort and no-op off the Deck, when umu
+    // already has a runtime, or when no Steam sniper runtime is present.
+    prestage_steam_runtime_on_deck();
 
     setup_wine_registry().await?;
 
