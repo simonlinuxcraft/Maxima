@@ -828,6 +828,39 @@ fn get_wine_release() -> Result<GithubRelease, WineError> {
     release.ok_or(WineError::Fetch)
 }
 
+// MAXIMA-LINUX-PORT-MOD: await a helper child's output with an optional bound.
+// Helper wine calls (reg/inject/DIP) are expected to finish on their own; a hung
+// wineserver, umu.lock contention or a stuck umu/SLR runtime download would
+// otherwise block the launch flow forever (the user just stares at a spinner).
+// On timeout the child is SIGKILLed (caller sets kill_on_drop) and a TimedOut
+// error surfaces. The game itself (WaitForExitAndRun) passes None and runs untimed.
+async fn wait_output_bounded(
+    child: tokio::process::Child,
+    timeout: Option<std::time::Duration>,
+    wine_path: &str,
+    arg_log: &str,
+) -> Result<std::process::Output, std::io::Error> {
+    match timeout {
+        None => child.wait_with_output().await,
+        Some(d) => match tokio::time::timeout(d, child.wait_with_output()).await {
+            Ok(r) => r,
+            Err(_) => {
+                log::warn!(
+                    "wine command '{} {}' exceeded {}s; killing it (likely wineserver hang, \
+                     umu.lock contention or a stuck umu/SLR runtime download)",
+                    wine_path,
+                    arg_log,
+                    d.as_secs()
+                );
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("wine helper '{arg_log}' timed out after {}s", d.as_secs()),
+                ))
+            }
+        },
+    }
+}
+
 pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     arg: T,
     args: Option<I>,
@@ -850,6 +883,25 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     // legitimately and is excluded below.
     let arg_log = arg.as_ref().to_string_lossy().into_owned();
     let call_started = std::time::Instant::now();
+
+    // MAXIMA-LINUX-PORT-MOD: bound the helper calls so a hung wineserver,
+    // umu.lock contention or a stuck umu/SLR runtime download fails cleanly
+    // instead of hanging the launch forever. 600s is generous on purpose: a
+    // fresh Steam Deck's first call legitimately downloads the umu SLR runtime
+    // (~300MB) and unpacks GE-Proton, which can take minutes on slow links;
+    // the bound only catches a true deadlock. Tune via KYBER_WINE_HELPER_TIMEOUT_SECS.
+    // The game launch (WaitForExitAndRun) is never timed.
+    // ponytail: single generous bound; per-command-type tuning only if a Deck test shows it's needed.
+    let helper_timeout = if matches!(command_type, CommandType::WaitForExitAndRun) {
+        None
+    } else {
+        let secs = env::var("KYBER_WINE_HELPER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(600);
+        Some(std::time::Duration::from_secs(secs))
+    };
 
     // MAXIMA-LINUX-PORT-MOD: wrap the actual game launch in `gamemoderun`
     // when feral gamemode is installed. Only WaitForExitAndRun is the game
@@ -971,15 +1023,17 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
             .wait()
             .await?;
     } else if want_output {
-        let output = child
+        child
             .stdout(Stdio::piped())
             // MAXIMA-LINUX-PORT-MOD: silence stderr so Wine/umu fixme spam
             // does not leak into the parent terminal (matches Windows-side
             // GUI behaviour where helper subprocesses are silent).
-            .stderr(Stdio::null())
-            .spawn()?
-            .wait_with_output()
-            .await?;
+            .stderr(Stdio::null());
+        if helper_timeout.is_some() {
+            child.kill_on_drop(true);
+        }
+        let spawned = child.spawn()?;
+        let output = wait_output_bounded(spawned, helper_timeout, &wine_path, &arg_log).await?;
         output_str = String::from_utf8_lossy(&output.stdout).to_string();
         status = output.status;
     } else {
@@ -990,12 +1044,12 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
         // (e.g. CachyOS exit 101) the captured stderr is surfaced through
         // WineError::Command::output below so launcher logs show the real
         // Wine error instead of an empty string.
-        let output = child
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?
-            .wait_with_output()
-            .await?;
+        child.stdout(Stdio::null()).stderr(Stdio::piped());
+        if helper_timeout.is_some() {
+            child.kill_on_drop(true);
+        }
+        let spawned = child.spawn()?;
+        let output = wait_output_bounded(spawned, helper_timeout, &wine_path, &arg_log).await?;
         status = output.status;
         if !status.success() {
             output_str = String::from_utf8_lossy(&output.stderr).to_string();

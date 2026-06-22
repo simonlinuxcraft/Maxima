@@ -178,7 +178,10 @@ impl ActiveGameContext {
     /// First call latches the start of the window.
     #[allow(dead_code)]
     pub fn launch_grace_remaining(&mut self) -> bool {
-        const GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+        // 300s: a slow Steam Deck (cold prefix, SD-card BF2, first GE-Proton
+        // unpack) can take well over 2min from bootstrap-exit to the first LSX
+        // connect; 120s refocused the launcher over a still-loading game.
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(300);
         let now = std::time::Instant::now();
         let since = *self.first_exit_seen.get_or_insert(now);
         now.duration_since(since) < GRACE
