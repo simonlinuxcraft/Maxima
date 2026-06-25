@@ -343,6 +343,16 @@ pub async fn start_game(
         return Err(LaunchError::BootstrapMissing);
     }
 
+    // MAXIMA-LINUX-PORT-MOD: the resolved game directory becomes the
+    // bootstrap's working dir below. tokio's Command does chdir-before-exec,
+    // so a missing dir (stale/moved custom game path, unmounted drive) makes
+    // spawn fail with a bare ENOENT and the .expect() further down panics the
+    // worker. Check it here and return a typed error the launcher can show.
+    let game_cwd = PathBuf::from(path).safe_parent()?.to_owned();
+    if !game_cwd.exists() {
+        return Err(LaunchError::GamePath);
+    }
+
     let mut child = Command::new(bootstrap_path()?);
     child.arg("launch");
 
@@ -358,7 +368,7 @@ pub async fn start_game(
     let launch_id = Uuid::new_v4().to_string();
 
     child
-        .current_dir(PathBuf::from(path).safe_parent()?)
+        .current_dir(&game_cwd)
         // MAXIMA-LINUX-PORT-MOD: explicitly propagate en-US locale to the
         // bootstrap → umu-run → Proton → BF2 chain. The bootstrap binary
         // is launched directly via Command::new (not via run_wine_command)
@@ -444,7 +454,10 @@ pub async fn start_game(
     // here (the only key Steam itself sometimes overwrites between launches)
     // and conditionally call `lock_locale_just_in_time()` on mismatch.
 
-    let child = child.spawn().expect("Failed to start child");
+    // MAXIMA-LINUX-PORT-MOD: do not .expect() here. A spawn failure (e.g. the
+    // game dir vanished between the check above and now, or EACCES) must
+    // surface as a LaunchError, not panic the tokio worker.
+    let child = child.spawn().map_err(|e| LaunchError::Native(e.into()))?;
 
     maxima.playing = Some(ActiveGameContext::new(
         &launch_id,
