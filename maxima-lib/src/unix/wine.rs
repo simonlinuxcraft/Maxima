@@ -36,12 +36,18 @@ lazy_static! {
     // with identical lines. Logs once per unique resolution, including after
     // a hot-switch from the launcher UI.
     static ref LAST_PROTON_LOG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    // MAXIMA-LINUX-PORT-MOD 2026-06-07: matches a system GE-Proton 10.x install
-    // directory (e.g. "GE-Proton10-34"). Only the 10.x series is auto-picked:
-    // it is the same major series as the bundled GE-Proton10-34 and is
-    // inject-compatible, unlike the Wine-10 WoW64 single-binary builds in
-    // GE-Proton 11+/proton-cachyos-11+ which break the injector.
-    static ref GE_PROTON_10_PATTERN: Regex = Regex::new(r"^GE-Proton10-(\d+)$").unwrap();
+    // MAXIMA-LINUX-PORT-MOD: matches a system GE-Proton 10.x or 11.x install
+    // directory (e.g. "GE-Proton10-34", "GE-Proton11-1"). Both series are
+    // inject-compatible since the injector moved to dll-syringe 0.15.3, which
+    // handles the Wine-10 WoW64 single-binary layout (verified with GE-Proton11-1).
+    // Group 1 = major series (10 or 11), group 2 = minor.
+    static ref GE_PROTON_PATTERN: Regex = Regex::new(r"^GE-Proton(1[01])-(\d+)$").unwrap();
+    // MAXIMA-LINUX-PORT-MOD 2026-06-28: also recognise proton-cachyos builds
+    // (e.g. "proton-cachyos", "proton-cachyos-11.0-..."). They ship the Wine-10/11
+    // WoW64 layout and are inject-compatible, but rank below GE-Proton in
+    // auto-detect because only GE-Proton11-1 is verified; CachyOS is taken as a
+    // fallback when no GE-Proton is present (Issue #14: CachyOS user).
+    static ref CACHYOS_PROTON_PATTERN: Regex = Regex::new(r"(?i)^proton-cachyos").unwrap();
     // MAXIMA-LINUX-PORT-MOD 2026-06-07: process-lifetime memo of the system
     // GE-Proton 10.x auto-detection (a ~30-stat scan) so the multiple
     // resolve_effective_proton_path() calls per launch don't re-scan. Outer
@@ -200,10 +206,11 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-06-07: non-persistent auto-detect of a system
-// GE-Proton 10.x. On a fresh install (no managed proton downloaded yet, no
-// user-set custom path) this lets the launch flow route wine/proton at an
-// already-present GE-Proton 10.x in the Steam compatibilitytools.d dirs and
-// skip the ~516MB GE-Proton download entirely. Deliberately does NOT write the
+// proton (GE-Proton 10.x/11.x, or proton-cachyos as fallback). On a fresh
+// install (no managed proton downloaded yet, no user-set custom path) this lets
+// the launch flow route wine/proton at an already-present build in the Steam
+// compatibilitytools.d dirs and skip the ~516MB GE-Proton download entirely.
+// Deliberately does NOT write the
 // user custom-proton sidecar, so it never shows up as a user choice in the UI;
 // it flows only through resolve_effective_proton_path() into the existing
 // Option H symlink machinery. Falls back to the (resumable) download when no
@@ -247,10 +254,24 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
         ),
         "/usr/share/steam/compatibilitytools.d".to_string(),
         "/usr/local/share/steam/compatibilitytools.d".to_string(),
+        // MAXIMA-LINUX-PORT-MOD: also probe non-Steam launcher Proton dirs so the
+        // Non-Steam path (and any fresh install) can route at an already-present
+        // GE-Proton without the ~516MB download. Heroic and Lutris keep GE-Proton
+        // under these paths; GE-Proton (10.x/11.x) or proton-cachyos is picked,
+        // same as Steam.
+        format!("{}/.config/heroic/tools/proton", home),
+        format!(
+            "{}/.var/app/com.heroicgameslauncher.hgl/config/heroic/tools/proton",
+            home
+        ),
+        format!("{}/.local/share/lutris/runners/proton", home),
+        format!("{}/.var/app/net.lutris.Lutris/data/lutris/runners/proton", home),
     ];
 
-    // Pick the highest GE-Proton 10.x minor found across all roots.
-    let mut best: Option<(u32, PathBuf)> = None;
+    // Pick the best system proton across all roots. Key is (tier, major, minor):
+    // GE-Proton is tier 1 (verified inject-compatible), proton-cachyos is tier 0
+    // (accepted fallback). Tuple ordering prefers GE-Proton, then the newer series.
+    let mut best: Option<((u32, u32, u32), PathBuf)> = None;
     for root in roots.iter() {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
@@ -265,28 +286,32 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            let minor = match GE_PROTON_10_PATTERN
-                .captures(&name)
-                .and_then(|c| c.get(1))
-                .and_then(|m| m.as_str().parse::<u32>().ok())
-            {
-                Some(m) => m,
-                None => continue,
+            let key = if let Some(caps) = GE_PROTON_PATTERN.captures(&name) {
+                match (
+                    caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
+                    caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
+                ) {
+                    (Some(major), Some(minor)) => (1, major, minor),
+                    _ => continue,
+                }
+            } else if CACHYOS_PROTON_PATTERN.is_match(&name) {
+                (0, 0, 0)
+            } else {
+                continue;
             };
             if !is_valid_proton_layout(&path) {
                 continue;
             }
-            if best.as_ref().map(|(m, _)| minor > *m).unwrap_or(true) {
-                best = Some((minor, path));
+            if best.as_ref().map(|(v, _)| key > *v).unwrap_or(true) {
+                best = Some((key, path));
             }
         }
     }
 
     match best {
-        Some((minor, path)) => {
+        Some((_key, path)) => {
             info!(
-                "[auto-proton] using system GE-Proton10-{} at {} (skipping download)",
-                minor,
+                "[auto-proton] using system proton at {} (skipping download)",
                 path.display()
             );
             Some(path)
@@ -303,6 +328,27 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
 // untouched so the launcher UI still reports auto-routing as "not user-set".
 fn resolve_effective_proton_path() -> Option<PathBuf> {
     resolve_custom_proton_path().or_else(auto_detect_system_proton)
+}
+
+// MAXIMA-LINUX-PORT-MOD: true when a Proton build is already on disk, so a
+// launch can proceed without the ~516MB managed GE-Proton download. Covers all
+// three no-download sources: a custom path/sidecar, an auto-detected system
+// GE-Proton 10.x, or a managed GE-Proton already extracted into the default
+// dir. The Non-Steam standalone-prefix path gates on this to fail clean
+// ("set KYBER_PROTON_PATH") instead of kicking off a cold download that stalls
+// on a Steam Deck.
+pub fn proton_resolvable_without_download() -> bool {
+    if resolve_effective_proton_path().is_some() {
+        return true;
+    }
+    // Or the Option-H routing point already resolves to a valid Proton: a
+    // managed GE-Proton extracted there, OR a prior routing symlink pointing at
+    // a real Proton build (e.g. compatibilitytools.d/Proton-GE Latest whose name
+    // the GE-Proton10 auto-detect does not match). is_valid_proton_layout follows
+    // the symlink, so both cases are caught without a download.
+    default_proton_dir()
+        .map(|p| is_valid_proton_layout(&p))
+        .unwrap_or(false)
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-05-26: Option H. proton_dir() now always returns
@@ -354,6 +400,16 @@ pub fn ensure_proton_routing() -> Result<(), NativeError> {
 
     let proton = default_proton_dir()?;
     let backup = proton.with_extension("maxima-backup");
+
+    // MAXIMA-LINUX-PORT-MOD: ensure the parent (~/.local/share/maxima/wine) exists
+    // before any symlink/rename below. A Non-Steam user who sets a custom Proton in
+    // the UI before ever launching BF2 has no wine/ dir yet, so the symlink would
+    // otherwise fail with a bare "No such file or directory (os error 2)" on save.
+    if let Some(parent) = proton.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
 
     match resolve_effective_proton_path() {
         Some(custom) => {
@@ -891,7 +947,6 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     // (~300MB) and unpacks GE-Proton, which can take minutes on slow links;
     // the bound only catches a true deadlock. Tune via KYBER_WINE_HELPER_TIMEOUT_SECS.
     // The game launch (WaitForExitAndRun) is never timed.
-    // ponytail: single generous bound; per-command-type tuning only if a Deck test shows it's needed.
     let helper_timeout = if matches!(command_type, CommandType::WaitForExitAndRun) {
         None
     } else {
@@ -1523,7 +1578,7 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         return Ok(());
     }
     log::info!(
-        "setup_wine_registry: pre-flight verify found mismatches — \
+        "setup_wine_registry: pre-flight verify found mismatches, \
          applying full set of {} reg add entries",
         ENTRIES.len()
     );
@@ -1595,7 +1650,7 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
 }
 
 /// Just-in-time re-write of the locale-critical keys, run *immediately*
-/// before the BF2 spawn — after the full `setup_wine_registry()` block
+/// before the BF2 spawn, after the full `setup_wine_registry()` block
 /// but separated by license/cloud-sync/protonfix activity that may
 /// re-initialise parts of the prefix and clobber Steam-language /
 /// International values.
@@ -1682,7 +1737,7 @@ pub async fn lock_locale_just_in_time() -> Result<(), NativeError> {
 /// each value contained the expected English token. Callers use this
 /// as a fast pre-flight to skip the expensive `setup_wine_registry()`
 /// and `lock_locale_just_in_time()` paths when the prefix is already
-/// in the desired state — typically the case on warm launches where
+/// in the desired state, typically the case on warm launches where
 /// nothing tampered with the registry between sessions. Saves ~50s
 /// per warm launch (15 reg-add calls @ ~3s each via umu-run).
 pub async fn verify_locale_is_english() -> bool {
