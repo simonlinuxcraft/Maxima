@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine};
 use derive_getters::Getters;
-use log::{error, info};
+use log::{error, info, warn};
 use std::{env, fmt::Display, path::PathBuf, sync::Arc};
 use tokio::{
     process::{Child, Command},
@@ -497,7 +497,7 @@ async fn request_opaque_ooa_token(access_token: &str) -> Result<String, AuthErro
 pub async fn mx_linux_setup() -> Result<(), NativeError> {
     use crate::unix::wine::{
         check_runtime_validity, check_wine_validity, get_lutris_runtimes, install_runtime,
-        install_wine, prestage_steam_runtime_on_deck, setup_wine_registry,
+        install_wine, prestage_steam_runtime_on_deck, setup_wine_registry, wine_dir,
     };
 
     info!("Verifying wine dependencies...");
@@ -507,12 +507,27 @@ pub async fn mx_linux_setup() -> Result<(), NativeError> {
         if !check_wine_validity().await? {
             install_wine().await?;
         }
-        let runtimes = get_lutris_runtimes().await?;
-        if !check_runtime_validity("eac_runtime", &runtimes).await? {
-            install_runtime("eac_runtime", &runtimes).await?;
-        }
-        if !check_runtime_validity("umu", &runtimes).await? {
-            install_runtime("umu", &runtimes).await?;
+        match get_lutris_runtimes().await {
+            Ok(runtimes) => {
+                if !check_runtime_validity("eac_runtime", &runtimes).await? {
+                    install_runtime("eac_runtime", &runtimes).await?;
+                }
+                if !check_runtime_validity("umu", &runtimes).await? {
+                    install_runtime("umu", &runtimes).await?;
+                }
+            }
+            // MAXIMA-LINUX-PORT-MOD: a lutris.net outage hits every user at once and
+            // used to block the launch even with the runtimes already on disk. Keep
+            // going with what is installed; only a fresh install still has to fail.
+            Err(err) => {
+                let dir = wine_dir()?;
+                if dir.join("umu").exists() && dir.join("eac_runtime").exists() {
+                    warn!("Runtime version check unavailable ({err}), using installed runtimes");
+                } else {
+                    error!("Runtime version check unavailable ({err}), nothing installed yet");
+                    return Err(err.into());
+                }
+            }
         }
     }
 
