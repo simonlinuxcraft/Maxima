@@ -479,6 +479,13 @@ impl Maxima {
         // still alive — return without flipping playing to None.
         #[cfg(target_os = "linux")]
         {
+            // MAXIMA-LINUX-PORT-MOD: rate-limit the scan. update() is called
+            // every 25ms, and get_os_pid() walks all of /proc per call. Skipping
+            // means "no evidence the game stopped", so treat it like a hit and
+            // keep the launch alive until the next scan is due.
+            if !playing.pid_scan_due() {
+                return;
+            }
             let pid =
                 crate::lsx::connection::get_os_pid(playing).unwrap_or(0);
             if pid != 0 {

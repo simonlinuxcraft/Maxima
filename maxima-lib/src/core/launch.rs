@@ -134,6 +134,9 @@ pub struct ActiveGameContext {
     /// observed exited. Used to grace-window the "game stopped" decision while
     /// BF2 cold-loads, injects and opens its LSX connection (Linux/umu only).
     first_exit_seen: Option<std::time::Instant>,
+    /// MAXIMA-LINUX-PORT-MOD: timestamp of the last get_os_pid() /proc scan,
+    /// so update_playing_status() can rate-limit it (Linux only).
+    last_pid_scan: Option<std::time::Instant>,
 }
 
 impl ActiveGameContext {
@@ -159,6 +162,7 @@ impl ActiveGameContext {
             process,
             started: false,
             first_exit_seen: None,
+            last_pid_scan: None,
         }
     }
 
@@ -168,6 +172,25 @@ impl ActiveGameContext {
 
     pub fn process_mut(&mut self) -> &mut Child {
         &mut self.process
+    }
+
+    /// MAXIMA-LINUX-PORT-MOD: true when the next get_os_pid() /proc scan is
+    /// due. update() runs at 25ms, but that scan walks every process (incl.
+    /// /proc/<pid>/environ, which takes the target's mmap_lock) and is the
+    /// heaviest thing the launcher does while BF2 cold-loads. The only cost of
+    /// rate-limiting it is up to INTERVAL of extra game-stop detection latency,
+    /// which is irrelevant next to the 300s grace window below.
+    #[allow(dead_code)]
+    pub fn pid_scan_due(&mut self) -> bool {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        let now = std::time::Instant::now();
+        match self.last_pid_scan {
+            Some(last) if now.duration_since(last) < INTERVAL => false,
+            _ => {
+                self.last_pid_scan = Some(now);
+                true
+            }
+        }
     }
 
     /// MAXIMA-LINUX-PORT-MOD: returns true while the post-bootstrap-exit grace
@@ -570,4 +593,34 @@ pub fn parse_arguments(input: &str) -> Vec<String> {
     }
 
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_context() -> ActiveGameContext {
+        // tokio::process::Child needs a reactor to register its SIGCHLD handler.
+        let process = Command::new("true").spawn().expect("spawning /bin/true");
+        ActiveGameContext::new(
+            "launch-id",
+            "/tmp/game",
+            "game.exe",
+            false,
+            "content-id",
+            None,
+            LaunchMode::Offline(String::new()),
+            process,
+        )
+    }
+
+    #[tokio::test]
+    async fn pid_scan_due_is_rate_limited() {
+        let mut ctx = dummy_context();
+        assert!(ctx.pid_scan_due(), "first scan must run");
+        assert!(
+            !ctx.pid_scan_due(),
+            "second scan within the interval must be skipped"
+        );
+    }
 }

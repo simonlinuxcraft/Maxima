@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use sysinfo::{Pid, PidExt, ProcessExt, System, SystemExt};
+use sysinfo::{Pid, PidExt, ProcessExt, ProcessRefreshKind, RefreshKind, System, SystemExt};
 use thiserror::Error;
 use tokio::sync::{MutexGuard, RwLock};
 
@@ -151,7 +151,15 @@ impl ConnectionState {
 pub fn get_os_pid(context: &ActiveGameContext) -> Result<u32, NativeError> {
     let mut pid = None;
 
-    let sys = System::new_all();
+    // MAXIMA-LINUX-PORT-MOD: only refresh processes. System::new_all() is
+    // RefreshKind::everything(), which additionally re-scans every hwmon node
+    // (on AMD that is an SMU firmware round-trip per sensor), runs statvfs()
+    // over every mount incl. FUSE, and reads /proc/<pid>/io per process. None
+    // of that is used here; cmd() and environ() are filled regardless of the
+    // ProcessRefreshKind.
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+    );
     for e in sys.processes() {
         let (p_pid, process) = e;
         if process.cmd().is_empty() {
