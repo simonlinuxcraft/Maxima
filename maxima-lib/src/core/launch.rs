@@ -477,10 +477,51 @@ pub async fn start_game(
     // here (the only key Steam itself sometimes overwrites between launches)
     // and conditionally call `lock_locale_just_in_time()` on mismatch.
 
+    // MAXIMA-LINUX-PORT-MOD: give the game its own UTS namespace whose
+    // hostname is "localhost" when the machine hostname maps to a loopback
+    // address other than 127.0.0.1 (127.0.1.1 on Debian, Ubuntu and other
+    // installers). A hosted listen server resolves itself by name, and with
+    // that mismatch the reply arrives from an address the client never
+    // connected to, so the local link never establishes and the game dies
+    // during the ingame transition. See unix/host_namespace.rs.
+    // KYBER_DISABLE_HOST_NAMESPACE=1 opts out.
+    #[cfg(target_os = "linux")]
+    if !env::var("KYBER_DISABLE_HOST_NAMESPACE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        && crate::unix::host_namespace::hostname_is_mismatched_loopback()
+    {
+        info!("Hostname does not resolve to 127.0.0.1, giving the game its own hostname so hosting works");
+        let plan = crate::unix::host_namespace::NamespacePlan::new();
+        // Safety: the closure only performs raw syscalls and never allocates.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(child.as_std_mut(), move || plan.apply())
+        };
+    }
+
     // MAXIMA-LINUX-PORT-MOD: do not .expect() here. A spawn failure (e.g. the
     // game dir vanished between the check above and now, or EACCES) must
     // surface as a LaunchError, not panic the tokio worker.
     let child = child.spawn().map_err(|e| LaunchError::Native(e.into()))?;
+
+    // MAXIMA-LINUX-PORT-MOD: report whether the game really ended up in its own
+    // UTS namespace. The work happens between fork and exec where nothing can
+    // be logged, and a silent no-op here looks exactly like a working fix.
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child.id() {
+        match (
+            std::fs::read_link("/proc/self/ns/uts"),
+            std::fs::read_link(format!("/proc/{pid}/ns/uts")),
+        ) {
+            (Ok(ours), Ok(theirs)) if ours != theirs => {
+                info!("Game runs in its own hostname namespace");
+            }
+            (Ok(_), Ok(_)) => {
+                info!("Game shares the launcher hostname namespace");
+            }
+            _ => {}
+        }
+    }
 
     maxima.playing = Some(ActiveGameContext::new(
         &launch_id,

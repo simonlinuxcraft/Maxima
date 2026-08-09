@@ -101,6 +101,9 @@ wmi = "0.13.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 smbios-lib = "0.9.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 prost-build = "0.12.3"
 
