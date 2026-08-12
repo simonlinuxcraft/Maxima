@@ -258,6 +258,24 @@ fn proton_rank(name: &str) -> Option<(u32, u32, u32)> {
     None
 }
 
+// MAXIMA-LINUX-PORT-MOD 2026-08-12: the release tag a Proton directory actually
+// holds. The directory name is not authoritative: on the machine this was found
+// on, compatibilitytools.d/GE-Proton10-34 is a symlink to Lutris' "Proton-GE
+// Latest", which resolves to 11-3 today, so ranking by name would have run 11-3
+// while the log claimed the pinned build. GE-Proton writes "<timestamp> <tag>"
+// into `version`; trust that and fall back to the directory name when it is
+// absent (Proton-EM and hand-built directories have no version file).
+fn proton_tag(path: &Path) -> Option<String> {
+    if let Ok(contents) = std::fs::read_to_string(path.join("version")) {
+        if let Some(tag) = contents.split_whitespace().last() {
+            if !tag.is_empty() {
+                return Some(tag.to_string());
+            }
+        }
+    }
+    path.file_name().and_then(|n| n.to_str()).map(str::to_string)
+}
+
 // MAXIMA-LINUX-PORT-MOD 2026-08-12: the x86_64 tarball of a GE-Proton release.
 // Matched by shape rather than by an exact-version regex; GE-Proton11-4 renamed
 // the asset to `GE-Proton11-4-x86_64.tar.gz` and added an aarch64 build, which
@@ -276,6 +294,16 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
             if !meta.file_type().is_symlink() && meta.is_dir() {
                 return None;
             }
+        }
+        // MAXIMA-LINUX-PORT-MOD 2026-08-12: a managed Proton that is currently
+        // moved aside for a custom-Proton symlink still counts as present.
+        // Restoring it is exactly what clearing the custom path is supposed to
+        // do, so auto-detection must not step in front of it and route at some
+        // other system build instead. Without this a user who once downloaded
+        // the managed Proton could never get back to it while any GE-Proton sat
+        // in compatibilitytools.d.
+        if is_valid_proton_layout(&default.with_extension("maxima-backup")) {
+            return None;
         }
     }
 
@@ -327,11 +355,11 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
             if !path.is_dir() {
                 continue;
             }
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
+            let tag = match proton_tag(&path) {
+                Some(t) => t,
                 None => continue,
             };
-            let key = match proton_rank(&name) {
+            let key = match proton_rank(&tag) {
                 Some(k) => k,
                 None => continue,
             };
@@ -1957,6 +1985,23 @@ mod tests {
         assert!(older_ge > cachyos);
         assert_eq!(proton_rank("UMU-Proton-10.0-4"), None);
         assert_eq!(proton_rank("Proton 9.0"), None);
+    }
+
+    #[test]
+    fn version_file_beats_the_directory_name() {
+        // A directory named after one release can hold another. Found in the
+        // field: compatibilitytools.d/GE-Proton10-34 was a symlink to Lutris'
+        // rolling "Proton-GE Latest", which had moved on to 11-3.
+        let dir = std::env::temp_dir().join("maxima-proton-tag-test/GE-Proton10-34");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("version"), "1784964208 GE-Proton11-3\n").unwrap();
+        assert_eq!(proton_tag(&dir).as_deref(), Some("GE-Proton11-3"));
+
+        // No version file (Proton-EM, hand-built): the name is all there is.
+        std::fs::remove_file(dir.join("version")).unwrap();
+        assert_eq!(proton_tag(&dir).as_deref(), Some("GE-Proton10-34"));
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 
     #[test]
