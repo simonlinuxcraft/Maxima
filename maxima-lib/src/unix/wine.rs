@@ -12,7 +12,6 @@ use std::{
 use flate2::read::GzDecoder;
 use lazy_static::lazy_static;
 use log::{info, warn};
-use regex::Regex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tar::Archive;
@@ -42,19 +41,7 @@ lazy_static! {
     // with identical lines. Logs once per unique resolution, including after
     // a hot-switch from the launcher UI.
     static ref LAST_PROTON_LOG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    // MAXIMA-LINUX-PORT-MOD: matches a system GE-Proton 10.x or 11.x install
-    // directory (e.g. "GE-Proton10-34", "GE-Proton11-1"). Both series are
-    // inject-compatible since the injector moved to dll-syringe 0.15.3, which
-    // handles the Wine-10 WoW64 single-binary layout (verified with GE-Proton11-1).
-    // Group 1 = major series (10 or 11), group 2 = minor.
-    static ref GE_PROTON_PATTERN: Regex = Regex::new(r"^GE-Proton(1[01])-(\d+)$").unwrap();
-    // MAXIMA-LINUX-PORT-MOD 2026-06-28: also recognise proton-cachyos builds
-    // (e.g. "proton-cachyos", "proton-cachyos-11.0-..."). They ship the Wine-10/11
-    // WoW64 layout and are inject-compatible, but rank below GE-Proton in
-    // auto-detect because only GE-Proton11-1 is verified; CachyOS is taken as a
-    // fallback when no GE-Proton is present (Issue #14: CachyOS user).
-    static ref CACHYOS_PROTON_PATTERN: Regex = Regex::new(r"(?i)^proton-cachyos").unwrap();
-    // MAXIMA-LINUX-PORT-MOD 2026-06-07: process-lifetime memo of the system
+            // MAXIMA-LINUX-PORT-MOD 2026-06-07: process-lifetime memo of the system
     // GE-Proton 10.x auto-detection (a ~30-stat scan) so the multiple
     // resolve_effective_proton_path() calls per launch don't re-scan. Outer
     // Option = "computed yet?", inner Option = the detected path (None = none
@@ -235,29 +222,6 @@ fn auto_detect_system_proton() -> Option<PathBuf> {
     result
 }
 
-// MAXIMA-LINUX-PORT-MOD 2026-08-12: rank a compat-tools directory name for
-// auto-detection. Higher wins, None means unusable. Tier 2 is the pinned build,
-// tier 1 other GE-Proton (verified inject-compatible, newer series first), tier 0
-// proton-cachyos as accepted fallback.
-fn proton_rank(name: &str) -> Option<(u32, u32, u32)> {
-    if name == PROTON_TAG {
-        return Some((2, 0, 0));
-    }
-    if let Some(caps) = GE_PROTON_PATTERN.captures(name) {
-        return match (
-            caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
-            caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
-        ) {
-            (Some(major), Some(minor)) => Some((1, major, minor)),
-            _ => None,
-        };
-    }
-    if CACHYOS_PROTON_PATTERN.is_match(name) {
-        return Some((0, 0, 0));
-    }
-    None
-}
-
 // MAXIMA-LINUX-PORT-MOD 2026-08-12: the release tag a Proton directory actually
 // holds. The directory name is not authoritative: on the machine this was found
 // on, compatibilitytools.d/GE-Proton10-34 is a symlink to Lutris' "Proton-GE
@@ -333,18 +297,13 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
         format!("{}/.var/app/net.lutris.Lutris/data/lutris/runners/proton", home),
     ];
 
-    // Pick the best system proton across all roots. Key is (tier, major, minor):
-    // the pinned build is tier 2, other GE-Proton is tier 1 (verified
-    // inject-compatible), proton-cachyos is tier 0 (accepted fallback). Tuple
-    // ordering prefers the pin, then GE-Proton, then the newer series.
-    //
-    // MAXIMA-LINUX-PORT-MOD 2026-08-12: the pin tier keeps "default" meaning the
-    // same build everywhere. Without it a system that happens to carry a newer
-    // GE-Proton silently ran that one instead, so the pinned version only ever
-    // applied to the download. Newer builds stay reachable through the custom
-    // Proton setting, and a system without the pinned build still avoids the
-    // download by picking its best GE-Proton.
-    let mut best: Option<((u32, u32, u32), PathBuf)> = None;
+    // MAXIMA-LINUX-PORT-MOD 2026-08-12: accept only the pinned build. This used
+    // to rank whatever GE-Proton it could find and take the newest, which meant
+    // "default" resolved to a different Proton on every machine, and a launch
+    // problem could never be reproduced from a bug report. Saving the download
+    // is not worth that: it is streamed, resumable and shows progress, so a
+    // first launch on an unusual system costs time, not a dead end. Anyone who
+    // wants a different build points the custom Proton setting at it.
     for root in roots.iter() {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
@@ -352,36 +311,22 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            if !path.is_dir() || proton_tag(&path).as_deref() != Some(PROTON_TAG) {
                 continue;
             }
-            let tag = match proton_tag(&path) {
-                Some(t) => t,
-                None => continue,
-            };
-            let key = match proton_rank(&tag) {
-                Some(k) => k,
-                None => continue,
-            };
             if !is_valid_proton_layout(&path) {
                 continue;
             }
-            if best.as_ref().map(|(v, _)| key > *v).unwrap_or(true) {
-                best = Some((key, path));
-            }
+            info!(
+                "[auto-proton] using {} found at {} (skipping download)",
+                PROTON_TAG,
+                path.display()
+            );
+            return Some(path);
         }
     }
 
-    match best {
-        Some((_key, path)) => {
-            info!(
-                "[auto-proton] using system proton at {} (skipping download)",
-                path.display()
-            );
-            Some(path)
-        }
-        None => None,
-    }
+    None
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-06-07: the proton path that should actually drive
@@ -392,6 +337,46 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
 // untouched so the launcher UI still reports auto-routing as "not user-set".
 fn resolve_effective_proton_path() -> Option<PathBuf> {
     resolve_custom_proton_path().or_else(auto_detect_system_proton)
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-08-12: what the next launch will actually run, as
+// (path, release tag, origin). The launcher shows this so nobody has to reason
+// about the resolution order or read a log to find out. Origin is one of
+// "custom", "detected", "managed" or "download". The tag comes from the build
+// itself, so a directory named after a different release, or a symlink into a
+// rolling "latest" directory, cannot misreport what is running.
+pub fn active_proton_info() -> (String, String, String) {
+    let describe = |path: PathBuf, origin: &str| {
+        let tag = proton_tag(&path).unwrap_or_else(|| "unknown".to_string());
+        (path.display().to_string(), tag, origin.to_string())
+    };
+
+    if let Some(custom) = resolve_custom_proton_path() {
+        return describe(custom, "custom");
+    }
+    if let Some(detected) = auto_detect_system_proton() {
+        return describe(detected, "detected");
+    }
+    if let Ok(default) = default_proton_dir() {
+        let backup = default.with_extension("maxima-backup");
+        // Neither custom nor detected applies, so a symlink at the routing point
+        // is a leftover of a route that no longer holds. ensure_proton_routing()
+        // swaps the backup back in on the next launch, so report the backup and
+        // not whatever the stale link still points at.
+        let stale_link = std::fs::symlink_metadata(&default)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if stale_link && is_valid_proton_layout(&backup) {
+            return describe(backup, "managed");
+        }
+        if is_valid_proton_layout(&default) {
+            return describe(default, "managed");
+        }
+        if is_valid_proton_layout(&backup) {
+            return describe(backup, "managed");
+        }
+    }
+    (String::new(), PROTON_TAG.to_string(), "download".to_string())
 }
 
 // MAXIMA-LINUX-PORT-MOD: true when a Proton build is already on disk, so a
@@ -1974,20 +1959,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pinned_build_outranks_every_other_proton() {
-        let pinned = proton_rank(PROTON_TAG).unwrap();
-        let newer_ge = proton_rank("GE-Proton11-3").unwrap();
-        let older_ge = proton_rank("GE-Proton10-9").unwrap();
-        let cachyos = proton_rank("proton-cachyos-11.0").unwrap();
-
-        assert!(pinned > newer_ge, "the pin must win over a newer GE-Proton");
-        assert!(newer_ge > older_ge);
-        assert!(older_ge > cachyos);
-        assert_eq!(proton_rank("UMU-Proton-10.0-4"), None);
-        assert_eq!(proton_rank("Proton 9.0"), None);
-    }
-
-    #[test]
     fn version_file_beats_the_directory_name() {
         // A directory named after one release can hold another. Found in the
         // field: compatibilitytools.d/GE-Proton10-34 was a symlink to Lutris'
@@ -1996,6 +1967,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("version"), "1784964208 GE-Proton11-3\n").unwrap();
         assert_eq!(proton_tag(&dir).as_deref(), Some("GE-Proton11-3"));
+        // Which is what auto-detection compares against, so this directory is
+        // not the pinned build no matter what it is called.
+        assert_ne!(proton_tag(&dir).as_deref(), Some(PROTON_TAG));
 
         // No version file (Proton-EM, hand-built): the name is all there is.
         std::fs::remove_file(dir.join("version")).unwrap();
