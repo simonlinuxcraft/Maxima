@@ -1005,6 +1005,22 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     // present" and pops up a black console window; Stdio::null keeps
     // those helpers headless.
     binding.stdin(Stdio::null());
+
+    // MAXIMA-LINUX-PORT-MOD 2026-08-12: drop the host's per-category locale
+    // variables. LC_ALL below already overrides them for everything the game
+    // does, but pressure-vessel's pv-locale-gen reads every LC_* it can find and
+    // generates that locale inside the container on every single launch. On a
+    // German desktop LC_ADDRESS=de_DE.UTF-8 survived LC_ALL and cost a locale
+    // build per start for a locale nothing then used. LANGUAGE goes too, it is
+    // gettext's list and carries the same de_DE. LANG and LC_ALL are set below.
+    for (key, _) in env::vars_os() {
+        if let Some(name) = key.to_str() {
+            if (name.starts_with("LC_") && name != "LC_ALL") || name == "LANGUAGE" {
+                binding.env_remove(name);
+            }
+        }
+    }
+
     let mut child = binding
         .env("WINEPREFIX", proton_prefix_path)
         .env("GAMEID", "umu-0")
