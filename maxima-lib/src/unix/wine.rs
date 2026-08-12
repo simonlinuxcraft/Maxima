@@ -24,13 +24,19 @@ use tokio::{
 use xz2::read::XzDecoder;
 
 use crate::util::{
-    github::{fetch_github_release, fetch_github_releases, github_download_asset, GithubRelease},
+    github::{fetch_github_release, github_download_asset, GithubRelease},
     native::{maxima_dir, DownloadError, NativeError, SafeParent, SafeStr, WineError},
     registry::RegistryError,
 };
 
+// MAXIMA-LINUX-PORT-MOD 2026-08-12: the Proton build this port ships against.
+// Pinned instead of tracking GE's newest release: every GE release used to force
+// a ~500MB re-download, and GE-Proton11-4 renaming its release asset broke the
+// launch for everyone at once. Users who want a different build point the custom
+// Proton setting at it.
+const PROTON_TAG: &str = "GE-Proton10-34";
+
 lazy_static! {
-    static ref PROTON_PATTERN: Regex = Regex::new(r"GE-Proton\d+-\d+\.tar\.gz").unwrap();
     // MAXIMA-LINUX-PORT-MOD 2026-05-24: cache last logged proton choice so
     // that proton_dir() (called 4-5x per game launch) does not spam the log
     // with identical lines. Logs once per unique resolution, including after
@@ -229,6 +235,37 @@ fn auto_detect_system_proton() -> Option<PathBuf> {
     result
 }
 
+// MAXIMA-LINUX-PORT-MOD 2026-08-12: rank a compat-tools directory name for
+// auto-detection. Higher wins, None means unusable. Tier 2 is the pinned build,
+// tier 1 other GE-Proton (verified inject-compatible, newer series first), tier 0
+// proton-cachyos as accepted fallback.
+fn proton_rank(name: &str) -> Option<(u32, u32, u32)> {
+    if name == PROTON_TAG {
+        return Some((2, 0, 0));
+    }
+    if let Some(caps) = GE_PROTON_PATTERN.captures(name) {
+        return match (
+            caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
+            caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
+        ) {
+            (Some(major), Some(minor)) => Some((1, major, minor)),
+            _ => None,
+        };
+    }
+    if CACHYOS_PROTON_PATTERN.is_match(name) {
+        return Some((0, 0, 0));
+    }
+    None
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-08-12: the x86_64 tarball of a GE-Proton release.
+// Matched by shape rather than by an exact-version regex; GE-Proton11-4 renamed
+// the asset to `GE-Proton11-4-x86_64.tar.gz` and added an aarch64 build, which
+// broke the old pattern and with it every auto-managed install.
+fn is_proton_asset(name: &str) -> bool {
+    name.starts_with("GE-Proton") && name.ends_with(".tar.gz") && !name.contains("aarch64")
+}
+
 fn compute_auto_detect_system_proton() -> Option<PathBuf> {
     // Only auto-route on a fresh install: if a real managed proton directory
     // already exists (previously downloaded), keep using it and never displace
@@ -269,8 +306,16 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
     ];
 
     // Pick the best system proton across all roots. Key is (tier, major, minor):
-    // GE-Proton is tier 1 (verified inject-compatible), proton-cachyos is tier 0
-    // (accepted fallback). Tuple ordering prefers GE-Proton, then the newer series.
+    // the pinned build is tier 2, other GE-Proton is tier 1 (verified
+    // inject-compatible), proton-cachyos is tier 0 (accepted fallback). Tuple
+    // ordering prefers the pin, then GE-Proton, then the newer series.
+    //
+    // MAXIMA-LINUX-PORT-MOD 2026-08-12: the pin tier keeps "default" meaning the
+    // same build everywhere. Without it a system that happens to carry a newer
+    // GE-Proton silently ran that one instead, so the pinned version only ever
+    // applied to the download. Newer builds stay reachable through the custom
+    // Proton setting, and a system without the pinned build still avoids the
+    // download by picking its best GE-Proton.
     let mut best: Option<((u32, u32, u32), PathBuf)> = None;
     for root in roots.iter() {
         let entries = match std::fs::read_dir(root) {
@@ -286,18 +331,9 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            let key = if let Some(caps) = GE_PROTON_PATTERN.captures(&name) {
-                match (
-                    caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()),
-                    caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
-                ) {
-                    (Some(major), Some(minor)) => (1, major, minor),
-                    _ => continue,
-                }
-            } else if CACHYOS_PROTON_PATTERN.is_match(&name) {
-                (0, 0, 0)
-            } else {
-                continue;
+            let key = match proton_rank(&name) {
+                Some(k) => k,
+                None => continue,
             };
             if !is_valid_proton_layout(&path) {
                 continue;
@@ -762,19 +798,10 @@ pub(crate) async fn check_wine_validity() -> Result<bool, NativeError> {
         return Ok(false);
     }
 
-    let version = versions()?.proton;
-
-    let release = get_wine_release();
-    if let Err(err) = release {
-        if !version.is_empty() {
-            warn!("Failed to check wine release, rate limited?");
-            return Ok(true);
-        }
-
-        return Err(NativeError::Wine(err));
-    }
-
-    Ok(version == release?.tag_name)
+    // MAXIMA-LINUX-PORT-MOD 2026-08-12: compare against the pinned tag instead
+    // of whatever GE released last. No network call in the check anymore, so a
+    // GitHub outage or rate limit can no longer influence a launch.
+    Ok(versions()?.proton == PROTON_TAG)
 }
 
 pub(crate) async fn get_lutris_runtimes() -> Result<Vec<LutrisRuntime>, WineError> {
@@ -869,19 +896,11 @@ pub(crate) async fn install_runtime(
 }
 
 fn get_wine_release() -> Result<GithubRelease, WineError> {
-    let releases = fetch_github_releases("GloriousEggroll", "proton-ge-custom")?;
-
-    let mut release = None;
-    for r in releases {
-        if r.tag_name.ends_with("LoL") {
-            continue;
-        }
-
-        release = Some(r);
-        break;
-    }
-
-    release.ok_or(WineError::Fetch)
+    Ok(fetch_github_release(
+        "GloriousEggroll",
+        "proton-ge-custom",
+        &format!("tags/{PROTON_TAG}"),
+    )?)
 }
 
 // MAXIMA-LINUX-PORT-MOD: await a helper child's output with an optional bound.
@@ -1165,11 +1184,7 @@ pub(crate) async fn install_wine() -> Result<(), NativeError> {
     }
 
     let release = get_wine_release()?;
-    let asset = match release
-        .assets
-        .iter()
-        .find(|x| PROTON_PATTERN.captures(&x.name).is_some())
-    {
+    let asset = match release.assets.iter().find(|x| is_proton_asset(&x.name)) {
         Some(asset) => asset,
         None => return Err(NativeError::Wine(WineError::Fetch)),
     };
@@ -1906,4 +1921,36 @@ pub async fn get_mx_wine_registry_value(query_key: &str) -> Result<Option<String
     };
 
     Ok(value.map(|x| x.replace("Z:", "").replace("\\", "/")))
+}
+
+// MAXIMA-LINUX-PORT-MOD 2026-08-12: the two decisions that broke every
+// auto-managed install when GE-Proton11-4 renamed its release asset.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_build_outranks_every_other_proton() {
+        let pinned = proton_rank(PROTON_TAG).unwrap();
+        let newer_ge = proton_rank("GE-Proton11-3").unwrap();
+        let older_ge = proton_rank("GE-Proton10-9").unwrap();
+        let cachyos = proton_rank("proton-cachyos-11.0").unwrap();
+
+        assert!(pinned > newer_ge, "the pin must win over a newer GE-Proton");
+        assert!(newer_ge > older_ge);
+        assert!(older_ge > cachyos);
+        assert_eq!(proton_rank("UMU-Proton-10.0-4"), None);
+        assert_eq!(proton_rank("Proton 9.0"), None);
+    }
+
+    #[test]
+    fn asset_matching_survives_the_rename() {
+        // Pre-rename layout (GE-Proton10-34, GE-Proton11-3).
+        assert!(is_proton_asset("GE-Proton10-34.tar.gz"));
+        // Post-rename layout (GE-Proton11-4 and later).
+        assert!(is_proton_asset("GE-Proton11-5-x86_64.tar.gz"));
+        // Neither the ARM build nor the checksum may ever be picked.
+        assert!(!is_proton_asset("GE-Proton11-5-aarch64.tar.gz"));
+        assert!(!is_proton_asset("GE-Proton10-34.sha512sum"));
+    }
 }

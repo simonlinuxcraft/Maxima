@@ -561,7 +561,8 @@ async fn request_opaque_ooa_token(access_token: &str) -> Result<String, AuthErro
 pub async fn mx_linux_setup() -> Result<(), NativeError> {
     use crate::unix::wine::{
         check_runtime_validity, check_wine_validity, get_lutris_runtimes, install_runtime,
-        install_wine, prestage_steam_runtime_on_deck, setup_wine_registry, wine_dir,
+        install_wine, prestage_steam_runtime_on_deck, proton_resolvable_without_download,
+        setup_wine_registry, wine_dir,
     };
 
     info!("Verifying wine dependencies...");
@@ -569,7 +570,19 @@ pub async fn mx_linux_setup() -> Result<(), NativeError> {
     let skip = std::env::var("MAXIMA_DISABLE_WINE_VERIFICATION").is_ok();
     if !skip {
         if !check_wine_validity().await? {
-            install_wine().await?;
+            // MAXIMA-LINUX-PORT-MOD 2026-08-12: a failed Proton *update* must not
+            // block a launch that already has a working Proton on disk. GE-Proton11-4
+            // renamed its release asset and every user whose recorded version was
+            // older lost the launch, with an unused but perfectly fine build sitting
+            // in wine/proton. Same reasoning as the lutris runtime fallback below:
+            // only a fresh install still has to fail.
+            if let Err(err) = install_wine().await {
+                if proton_resolvable_without_download() {
+                    warn!("Proton update failed ({err}), using the installed build");
+                } else {
+                    return Err(err);
+                }
+            }
         }
         match get_lutris_runtimes().await {
             Ok(runtimes) => {
