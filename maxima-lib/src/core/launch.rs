@@ -484,9 +484,25 @@ pub async fn start_game(
     // that mismatch the reply arrives from an address the client never
     // connected to, so the local link never establishes and the game dies
     // during the ingame transition. See unix/host_namespace.rs.
-    // KYBER_DISABLE_HOST_NAMESPACE=1 opts out.
+    //
+    // MAXIMA-LINUX-PORT-MOD 2026-08-15: opt-in instead of opt-out. Shipping this
+    // on by default in 6.4.12 broke launching outright on Ubuntu 26.04: the game
+    // spawned into the namespace, never connected back over LSX and never
+    // exited, so the launcher sat in "Starting Game..." forever. Two user logs
+    // show it cleanly, 7 launches with the namespace and not one reaching the
+    // DLL handshake, while every launch without it did. The trigger is the
+    // 127.0.1.1 line Debian and Ubuntu write by default, so it hit those users
+    // on every join even though only hosting needs the workaround.
+    //
+    // Why it hangs there is still unknown; X11 auth, bwrap under
+    // apparmor_restrict_unprivileged_userns=1 and a real Proton wine were all
+    // reproduced fine inside the namespace on 24.04. Until that is understood
+    // the launch path does not carry it. Hosts on affected systems get the
+    // one-off /etc/hosts fix from HostLoopbackWarning again, which is what they
+    // had before 6.4.12. KYBER_ENABLE_HOST_NAMESPACE=1 turns it back on for
+    // anyone diagnosing this.
     #[cfg(target_os = "linux")]
-    if !env::var("KYBER_DISABLE_HOST_NAMESPACE")
+    if env::var("KYBER_ENABLE_HOST_NAMESPACE")
         .map(|v| v == "1")
         .unwrap_or(false)
         && crate::unix::host_namespace::hostname_is_mismatched_loopback()

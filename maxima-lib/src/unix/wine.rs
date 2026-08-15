@@ -31,8 +31,13 @@ use crate::util::{
 // MAXIMA-LINUX-PORT-MOD 2026-08-12: the Proton build this port ships against.
 // Pinned instead of tracking GE's newest release: every GE release used to force
 // a ~500MB re-download, and GE-Proton11-4 renaming its release asset broke the
-// launch for everyone at once. Users who want a different build point the custom
-// Proton setting at it.
+// launch for everyone at once.
+//
+// The pin decides what a fresh install downloads and which build auto-detection
+// prefers. It is not a requirement: proton_rank() accepts any GE-Proton series
+// and proton-cachyos that is already on the machine, so nobody is pushed into a
+// download for a build they already have. Users who want a specific one point
+// the custom Proton setting at it.
 const PROTON_TAG: &str = "GE-Proton10-34";
 
 lazy_static! {
@@ -248,6 +253,36 @@ fn is_proton_asset(name: &str) -> bool {
     name.starts_with("GE-Proton") && name.ends_with(".tar.gz") && !name.contains("aarch64")
 }
 
+// MAXIMA-LINUX-PORT-MOD 2026-08-15: rank a Proton release tag for auto-detection.
+// Higher wins, None means the build is not usable. The pin ranks top so "default"
+// stays the tested build wherever it is present, but any GE-Proton series and
+// proton-cachyos are accepted below it. Accepting only the pin meant a machine
+// that already carried a working build still had to pull ~516MB, and a new GE
+// series would age out of a hardcoded list; the series number is parsed instead.
+fn proton_rank(tag: &str) -> (u32, u32, u32) {
+    if tag == PROTON_TAG {
+        return (3, 0, 0);
+    }
+    if let Some((major, minor)) = tag
+        .strip_prefix("GE-Proton")
+        .and_then(|rest| rest.split_once('-'))
+    {
+        if let (Ok(major), Ok(minor)) = (major.parse(), minor.parse()) {
+            return (2, major, minor);
+        }
+    }
+    if tag.to_ascii_lowercase().starts_with("proton-cachyos") {
+        return (1, 0, 0);
+    }
+    // Everything else a caller offers, including Valve's own builds and anything
+    // released after this code was written. Eligibility is decided by
+    // is_valid_proton_layout(), never by the name: matching names would mean
+    // guessing at every vendor's version string, and a build we failed to
+    // recognise would silently trigger a ~516MB download on a machine that
+    // already had a working Proton.
+    (0, 0, 0)
+}
+
 fn compute_auto_detect_system_proton() -> Option<PathBuf> {
     // Only auto-route on a fresh install: if a real managed proton directory
     // already exists (previously downloaded), keep using it and never displace
@@ -272,61 +307,104 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
     }
 
     let home = env::var("HOME").ok()?;
+    // (directory, only entries named "Proton*"). The filter exists for
+    // steamapps/common, which holds every installed game: without it this would
+    // stat hundreds of directories on every launch, the kind of full-tree scan
+    // that already caused a stutter once.
     let roots = [
-        format!("{}/.local/share/Steam/compatibilitytools.d", home),
-        format!("{}/.steam/steam/compatibilitytools.d", home),
-        format!("{}/.steam/root/compatibilitytools.d", home),
-        format!("{}/.steam/debian-installation/compatibilitytools.d", home),
-        format!(
-            "{}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d",
-            home
+        (format!("{}/.local/share/Steam/compatibilitytools.d", home), false),
+        (format!("{}/.steam/steam/compatibilitytools.d", home), false),
+        (format!("{}/.steam/root/compatibilitytools.d", home), false),
+        (format!("{}/.steam/debian-installation/compatibilitytools.d", home), false),
+        (
+            format!(
+                "{}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d",
+                home
+            ),
+            false,
         ),
-        "/usr/share/steam/compatibilitytools.d".to_string(),
-        "/usr/local/share/steam/compatibilitytools.d".to_string(),
+        ("/usr/share/steam/compatibilitytools.d".to_string(), false),
+        ("/usr/local/share/steam/compatibilitytools.d".to_string(), false),
         // MAXIMA-LINUX-PORT-MOD: also probe non-Steam launcher Proton dirs so the
         // Non-Steam path (and any fresh install) can route at an already-present
         // GE-Proton without the ~516MB download. Heroic and Lutris keep GE-Proton
         // under these paths; GE-Proton (10.x/11.x) or proton-cachyos is picked,
         // same as Steam.
-        format!("{}/.config/heroic/tools/proton", home),
-        format!(
-            "{}/.var/app/com.heroicgameslauncher.hgl/config/heroic/tools/proton",
-            home
+        (format!("{}/.config/heroic/tools/proton", home), false),
+        (
+            format!(
+                "{}/.var/app/com.heroicgameslauncher.hgl/config/heroic/tools/proton",
+                home
+            ),
+            false,
         ),
-        format!("{}/.local/share/lutris/runners/proton", home),
-        format!("{}/.var/app/net.lutris.Lutris/data/lutris/runners/proton", home),
+        (format!("{}/.local/share/lutris/runners/proton", home), false),
+        (format!("{}/.var/app/net.lutris.Lutris/data/lutris/runners/proton", home), false),
+        // MAXIMA-LINUX-PORT-MOD 2026-08-15: Valve ships its own Proton as a
+        // regular library entry rather than a compat tool, so it lives here and
+        // nowhere above. Ranked last, but detecting it saves a ~516MB download
+        // for someone who only ever installed Steam's Proton.
+        (format!("{}/.local/share/Steam/steamapps/common", home), true),
+        (format!("{}/.steam/steam/steamapps/common", home), true),
+        (format!("{}/.steam/root/steamapps/common", home), true),
+        (format!("{}/.steam/debian-installation/steamapps/common", home), true),
+        (
+            format!(
+                "{}/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common",
+                home
+            ),
+            true,
+        ),
     ];
 
-    // MAXIMA-LINUX-PORT-MOD 2026-08-12: accept only the pinned build. This used
-    // to rank whatever GE-Proton it could find and take the newest, which meant
-    // "default" resolved to a different Proton on every machine, and a launch
-    // problem could never be reproduced from a bug report. Saving the download
-    // is not worth that: it is streamed, resumable and shows progress, so a
-    // first launch on an unusual system costs time, not a dead end. Anyone who
-    // wants a different build points the custom Proton setting at it.
-    for root in roots.iter() {
+    // Pick the highest-ranking system proton across all roots: the pinned build
+    // first, then any other GE-Proton (newest series wins), then proton-cachyos.
+    // Ranking uses the tag the build reports, not its directory name, because a
+    // compatibilitytools.d entry is often a symlink to a differently named build.
+    // active_proton_info() reports what a launch actually resolved to, so a bug
+    // report stays reproducible without forcing everyone onto one build.
+    let mut best: Option<((u32, u32, u32), PathBuf)> = None;
+    for (root, proton_named_only) in roots.iter() {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
             Err(_) => continue,
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() || proton_tag(&path).as_deref() != Some(PROTON_TAG) {
+            // Cheap string test before any filesystem access. Anything that
+            // survives it still has to pass is_valid_proton_layout(), so a game
+            // with "proton" in its title costs one extra stat and nothing more.
+            if *proton_named_only
+                && !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("proton")
+            {
+                continue;
+            }
+            if !path.is_dir() {
                 continue;
             }
             if !is_valid_proton_layout(&path) {
                 continue;
             }
-            info!(
-                "[auto-proton] using {} found at {} (skipping download)",
-                PROTON_TAG,
-                path.display()
-            );
-            return Some(path);
+            let rank = proton_rank(proton_tag(&path).as_deref().unwrap_or(""));
+            if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+                best = Some((rank, path));
+            }
         }
     }
 
-    None
+    if let Some((_, path)) = best.as_ref() {
+        info!(
+            "[auto-proton] using {} found at {} (skipping download)",
+            proton_tag(path).as_deref().unwrap_or("proton"),
+            path.display()
+        );
+    }
+
+    best.map(|(_, path)| path)
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-06-07: the proton path that should actually drive
@@ -811,10 +889,15 @@ pub(crate) async fn check_wine_validity() -> Result<bool, NativeError> {
         return Ok(false);
     }
 
-    // MAXIMA-LINUX-PORT-MOD 2026-08-12: compare against the pinned tag instead
-    // of whatever GE released last. No network call in the check anymore, so a
-    // GitHub outage or rate limit can no longer influence a launch.
-    Ok(versions()?.proton == PROTON_TAG)
+    // MAXIMA-LINUX-PORT-MOD 2026-08-15: any managed build that recorded a version
+    // counts as installed. Demanding an exact match against the pin sent a
+    // working GE-Proton through a ~516MB re-download for nothing but a version
+    // number; the pin decides what a fresh install fetches, not what an existing
+    // install has to be. The directory itself was already checked above, so an
+    // empty version is the only thing left that means "nothing installed yet".
+    // Still no network call here, so a GitHub outage or rate limit cannot
+    // influence a launch.
+    Ok(!versions()?.proton.trim().is_empty())
 }
 
 pub(crate) async fn get_lutris_runtimes() -> Result<Vec<LutrisRuntime>, WineError> {
@@ -1976,6 +2059,47 @@ mod tests {
         assert_eq!(proton_tag(&dir).as_deref(), Some("GE-Proton10-34"));
 
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_pin_is_preferred_but_nothing_is_disqualified_by_name() {
+        // The pin outranks everything, so "default" stays the tested build
+        // wherever it is present.
+        let pinned = proton_rank(PROTON_TAG);
+        assert!(pinned > proton_rank("GE-Proton11-5"));
+        assert!(pinned > proton_rank("proton-cachyos"));
+
+        // A newer GE series outranks an older one, and a series that does not
+        // exist yet must not age out of the ordering.
+        assert!(proton_rank("GE-Proton11-5") > proton_rank("GE-Proton10-33"));
+        assert!(proton_rank("GE-Proton10-40") > proton_rank("GE-Proton10-9"));
+        assert!(proton_rank("GE-Proton12-1") > proton_rank("GE-Proton11-5"));
+
+        // GE-Proton beats proton-cachyos, which beats everything unrecognised.
+        assert!(proton_rank("GE-Proton10-33") > proton_rank("proton-cachyos-11.0"));
+        assert!(proton_rank("proton-cachyos-11.0") > proton_rank("proton-10.0-1c"));
+
+        // proton-cachyos keeps its own tier and is not swallowed by the
+        // generic "proton-" shape.
+        assert_eq!(proton_rank("proton-cachyos"), (1, 0, 0));
+
+        // The point of the rewrite: no name is disqualifying. Valve's builds,
+        // a vendor we have never seen, and a malformed GE name all stay usable,
+        // because is_valid_proton_layout() decides eligibility, not the string.
+        // Otherwise an unrecognised build would trigger a needless ~516MB
+        // download on a machine that already has a working Proton.
+        for tag in [
+            "proton-10.0-1c",
+            "experimental-11.0-20260805",
+            "Proton 10.0",
+            "Proton - Experimental",
+            "Proton Hotfix",
+            "some-future-proton-nobody-has-shipped-yet",
+            "GE-Protonx-y",
+            "",
+        ] {
+            assert_eq!(proton_rank(tag), (0, 0, 0), "tag {tag:?} must stay usable");
+        }
     }
 
     #[test]
