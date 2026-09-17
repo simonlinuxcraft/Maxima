@@ -20,7 +20,29 @@ below).
 
 ---
 
-## 2026-05-09 — Verify-first locale skip: ~50s warm-launch speedup
+## 2026-08-21: `GetPresence` answers with the requested user id
+
+**Files touched**
+- `maxima-lib/src/lsx/request/profile.rs`
+  - `handle_presence_request` replied with the constant `1005663144213`.
+    It now echoes `request.attr_UserId`.
+
+**Why**
+The constant is a real EA account id from the initial commit, so every
+session reported presence for someone else. In our logs the game always
+sends its own id here, so echoing it is correct for Battlefront II.
+
+The echo is used instead of `local_user()` because that call can hit the
+EA service layer without a timeout, and a handler error sends no reply at
+all (`lsx/connection.rs`), which leaves the game waiting.
+
+**Upstream tracking**
+Not Linux specific. Can go to `ArmchairDevelopers/Maxima` as a standalone
+pull request.
+
+---
+
+## 2026-05-09: Verify-first locale skip, ~50s warm-launch speedup
 
 **Files touched**
 - `maxima-lib/src/unix/wine.rs`
@@ -40,11 +62,11 @@ below).
     is skipped entirely.
 
 **Why**
-A successful "boot ➜ play BF2 ➜ exit ➜ play BF2 again" cycle was
+A successful "boot -> play BF2 -> exit -> play BF2 again" cycle was
 measured at ~73s per Locale-Setup pass on the user's machine: 48s for
 the `setup_wine_registry` 15-entry loop, 14s for `lock_locale_just_in_time`,
 11s for `verify_locale_is_english`. Each call is dominated by
-pressure-vessel container spawn cost (~3s) — the actual `reg.exe`
+pressure-vessel container spawn cost (~3s), the actual `reg.exe`
 work is sub-second.
 
 After the first successful launch, the four critical keys are already
@@ -54,10 +76,10 @@ is enough to confirm the state and short-circuit both expensive paths.
 
 **Effect**
 - Cold launch (fresh prefix or after a Steam/protonfix tamper):
-  ~73s → ~69s (verify costs 12s but prevents redundant follow-up writes
+  ~73s -> ~69s (verify costs 12s but prevents redundant follow-up writes
   when setup succeeded).
 - Warm launch (state intact from a previous launch):
-  ~73s → ~24s (verify only, both writes skipped).
+  ~73s -> ~24s (verify only, both writes skipped).
 
 The fall-through path is untouched: when verify reports a mismatch, the
 full `setup_wine_registry()` and `lock_locale_just_in_time()` paths run
@@ -70,7 +92,7 @@ above. Not portable upstream until that one lands.
 
 ---
 
-## 2026-05-09 — Layered locale lock to defeat the BF2 entitlement error
+## 2026-05-09: Layered locale lock to defeat the BF2 entitlement error
 
 **Files touched**
 - `maxima-lib/src/unix/wine.rs`
@@ -96,7 +118,7 @@ above. Not portable upstream until that one lands.
     the keys in a German state.
   - New `verify_locale_is_english()`: queries the four critical keys via
     `reg query`, logs each value, warns if the live value does not match
-    `en_US`/`en-US`/`ENU`/`english`. Diagnostic only — never blocks the
+    `en_US`/`en-US`/`ENU`/`english`. Diagnostic only, never blocks the
     launch. Closes the visibility gap that hid the previous regressions.
 - `maxima-lib/src/core/launch.rs`
   - In the bootstrap spawn block (around line 337), added explicit
@@ -145,7 +167,7 @@ through pressure-vessel. Will be offered upstream as an opt-in
 
 ---
 
-## 2026-05-09 — `registry.rs`: Linux `read_game_path` Steam-library detection
+## 2026-05-09: `registry.rs`: Linux `read_game_path` Steam-library detection
 
 **Files touched**
 - `maxima-lib/src/util/registry.rs`
@@ -168,7 +190,7 @@ through pressure-vessel. Will be offered upstream as an opt-in
 
 **Why**
 The Linux `todo!()` made every FFI call from the launcher's
-`get_game_dir(slug)` panic — in practice the Rust panic was caught
+`get_game_dir(slug)` panic. In practice the Rust panic was caught
 upstream and surfaced as an empty `String` to Dart, which then
 silently disabled every feature that needed the BF2 install path
 (mod manager root detection, screenshot path resolution, `bf2.exe`
@@ -187,10 +209,10 @@ catalog format with upstream (currently hardcoded BF2-only).
 
 ---
 
-## 2026-05-07 — `wine.rs`: silence subprocess stdio (no wineconsole popup)
+## 2026-05-07: `wine.rs`: silence subprocess stdio (no wineconsole popup)
 
 **Files touched**
-- `maxima-lib/src/unix/wine.rs` — in `run_wine_command()`:
+- `maxima-lib/src/unix/wine.rs`, in `run_wine_command()`:
   - Added `binding.stdin(Stdio::null())` immediately after the `Command::new`
     construction.
   - When `want_output == true`, added `.stderr(Stdio::null())` to the spawn chain.
@@ -207,7 +229,7 @@ the helpers headless and matches the Windows GUI behaviour.
 **Upstream tracking**
 Portable to upstream as a standalone change.
 
-## 2026-05-05 — `wine.rs`: registry-setup refactor + UMU_ZENITY env
+## 2026-05-05: `wine.rs`: registry-setup refactor + UMU_ZENITY env
 
 **Files touched**
 - `maxima-lib/src/unix/wine.rs`
@@ -247,7 +269,7 @@ refactor is portable across both trees in principle.
 
 ---
 
-## 2026-05-05 — Cargo dependency: `flate2` pin
+## 2026-05-05: Cargo dependency: `flate2` pin
 
 **Files touched**
 - `maxima-lib/Cargo.toml` (line 45)
@@ -273,7 +295,7 @@ and the issue may not be reproducible in the upstream CI.
 
 ---
 
-## 2026-05-05 — Add `QueryAchievements` LSX request handler stub
+## 2026-05-05: Add `QueryAchievements` LSX request handler stub
 
 **Files touched**
 - `maxima-lib/src/lsx/types.rs`
@@ -310,7 +332,7 @@ referencing
 
 ---
 
-## 2026-05-05 — LSX disconnect diagnostics
+## 2026-05-05: LSX disconnect diagnostics
 
 **Files touched**
 - `maxima-lib/src/lsx/connection.rs`

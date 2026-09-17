@@ -55,12 +55,14 @@ pub async fn handle_profile_request(
     })
 }
 
+// MAXIMA-LINUX-PORT-MOD: echo the requested id instead of a hardcoded account.
+// See CHANGES.md (2026-08-21).
 pub async fn handle_presence_request(
     _: LockedConnectionState,
-    _: LSXGetPresence,
+    request: LSXGetPresence,
 ) -> Result<Option<LSXResponseType>, LSXRequestError> {
     make_lsx_handler_response!(Response, GetPresenceResponse, {
-       attr_UserId: 1005663144213,
+       attr_UserId: request.attr_UserId,
        attr_Presence: LSXPresence::Ingame,
        attr_Title: None,
        attr_TitleId: None,
