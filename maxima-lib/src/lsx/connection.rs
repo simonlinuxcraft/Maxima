@@ -241,7 +241,7 @@ impl Connection {
                 // Linux process to find the .exe arg. That race-loses under
                 // umu-run/pressure-vessel because by the time LSX connects and
                 // we get here, the matched process may already have re-exec'd
-                // through python3 / bwrap / proton — its argv no longer
+                // through python3 / bwrap / proton, and its argv no longer
                 // contains the original game .exe path. The fallback to cmd()[0]
                 // produced wine-helper.exe queries for "python3" or "bwrap",
                 // both of which return PID 0, breaking inject silently.
@@ -252,7 +252,7 @@ impl Connection {
                 let filename = context.game_exe_filename();
                 if filename.is_empty() {
                     warn!(
-                        "ActiveGameContext.game_exe_filename is empty — \
+                        "ActiveGameContext.game_exe_filename is empty, \
                          wine_get_pid will likely fail. Check launch.rs"
                     );
                 } else {

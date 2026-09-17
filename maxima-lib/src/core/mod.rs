@@ -476,7 +476,7 @@ impl Maxima {
         // the moment LSX disconnects (~1s after inject), even though BF2
         // is still running. Cross-check via sysinfo: a process whose
         // MXLaunchId env var matches our launch_id means the game is
-        // still alive — return without flipping playing to None.
+        // still alive, so return without flipping playing to None.
         #[cfg(target_os = "linux")]
         {
             // MAXIMA-LINUX-PORT-MOD: rate-limit the scan. update() is called
