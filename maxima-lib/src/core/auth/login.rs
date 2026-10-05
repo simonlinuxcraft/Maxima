@@ -17,8 +17,9 @@ lazy_static! {
 // Zen) can swallow that callback, leaving the listener waiting forever.
 // Bound the whole wait so a missing callback fails with a clear, actionable
 // error instead of hanging the login. On timeout the listener is dropped,
-// freeing port 31033 for the next attempt.
-const LOGIN_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// freeing port 31033 for the next attempt. 15 minutes leave room for an EA
+// 2FA mail that arrives late; the wait cannot be cancelled in between.
+const LOGIN_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 // MAXIMA-LINUX-PORT-MOD 2026-06-07: open the EA sign-in URL in the user's real
 // browser, robust against the AppImage environment.

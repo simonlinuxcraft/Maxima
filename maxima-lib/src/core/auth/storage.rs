@@ -71,7 +71,7 @@ pub enum AuthError {
     Query,
     #[error("invalid redirect or chain `{0:?}`")]
     InvalidRedirect(Option<String>),
-    #[error("login timed out waiting for the browser sign-in. Set a native (non-sandboxed) default browser or sign in to the EA app first.")]
+    #[error("login timed out waiting for the browser sign-in. Set a native (non-sandboxed) default browser or sign in to the EA app first. To finish this sign-in, click Try again; if the browser then does not return to the launcher, paste the qrc:// link from its address bar into \"Browser didn't return to the launcher?\".")]
     LoginTimeout,
 }
 
