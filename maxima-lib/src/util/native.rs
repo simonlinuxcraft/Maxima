@@ -240,6 +240,16 @@ pub fn module_path() -> Result<PathBuf, NativeError> {
     Ok(env::current_exe()?)
 }
 
+// MAXIMA-LINUX-PORT-MOD: the launcher runs from bundle/ with the helpers in
+// bundle/cli/, the CLI runs from bundle/cli/ next to them.
+#[cfg(unix)]
+pub fn bundled_helper_path(name: &str) -> Result<PathBuf, NativeError> {
+    let exe = module_path()?;
+    let dir = exe.safe_parent()?;
+    let in_cli = dir.join("cli").join(name);
+    Ok(if in_cli.exists() { in_cli } else { dir.join(name) })
+}
+
 #[cfg(not(unix))]
 pub fn maxima_dir() -> Result<PathBuf, NativeError> {
     use directories::ProjectDirs;

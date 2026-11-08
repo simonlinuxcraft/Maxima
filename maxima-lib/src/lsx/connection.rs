@@ -235,20 +235,9 @@ impl Connection {
         let mut pid = get_os_pid(context);
         if cfg!(unix) {
             if let Ok(_os_pid) = pid {
-                // MAXIMA-LINUX-PORT-MOD: deterministic Wine-PID lookup.
-                //
-                // Previously this walked process.cmd()[] of the MXLaunchId-tagged
-                // Linux process to find the .exe arg. That race-loses under
-                // umu-run/pressure-vessel because by the time LSX connects and
-                // we get here, the matched process may already have re-exec'd
-                // through python3 / bwrap / proton, and its argv no longer
-                // contains the original game .exe path. The fallback to cmd()[0]
-                // produced wine-helper.exe queries for "python3" or "bwrap",
-                // both of which return PID 0, breaking inject silently.
-                //
-                // ActiveGameContext now carries the .exe filename captured
-                // from launch.rs::start_game() at spawn time, before any
-                // re-exec can mangle it. Use that directly.
+                // MAXIMA-LINUX-PORT-MOD: look the Wine PID up by the .exe name
+                // frozen at spawn time (see ActiveGameContext::game_exe_filename),
+                // not by walking argv, which umu-run has re-exec'd away by now.
                 let filename = context.game_exe_filename();
                 if filename.is_empty() {
                     warn!(

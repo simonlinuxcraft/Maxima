@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::{
     unix::wine::{run_wine_command, CommandType},
-    util::native::{module_path, NativeError, SafeParent, SafeStr},
+    util::native::{bundled_helper_path, NativeError, SafeStr},
 };
 
 lazy_static! {
@@ -34,14 +34,7 @@ pub async fn wine_get_pid(launch_id: &str, name: &str) -> Result<u32, NativeErro
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&launch_args)?);
-    // MAXIMA-LINUX-PORT-MOD: when running as Launcher FFI, exe is in bundle/
-    // but wine-helper.exe lives in bundle/cli/. Check cli/ first.
-    let exe = module_path()?;
-    let exe_parent = exe.safe_parent()?;
-    let wine_helper = {
-        let cli_path = exe_parent.join("cli").join("wine-helper.exe");
-        if cli_path.exists() { cli_path } else { exe_parent.join("wine-helper.exe") }
-    };
+    let wine_helper = bundled_helper_path("wine-helper.exe")?;
     let output = run_wine_command(
         wine_helper.safe_str()?,
         Some(vec!["get_pid", b64.as_str()]),
@@ -77,13 +70,7 @@ pub async fn request_library_injection(pid: u32, path: &str) -> Result<(), Nativ
     };
 
     let b64 = general_purpose::STANDARD.encode(serde_json::to_string(&launch_args)?);
-    // MAXIMA-LINUX-PORT-MOD: same cli/ fallback as wine_get_pid above.
-    let exe = module_path()?;
-    let exe_parent = exe.safe_parent()?;
-    let wine_helper = {
-        let cli_path = exe_parent.join("cli").join("wine-helper.exe");
-        if cli_path.exists() { cli_path } else { exe_parent.join("wine-helper.exe") }
-    };
+    let wine_helper = bundled_helper_path("wine-helper.exe")?;
     run_wine_command(
         wine_helper.safe_str()?,
         Some(vec!["inject", b64.as_str()]),

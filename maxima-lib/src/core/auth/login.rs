@@ -56,13 +56,9 @@ fn open_login_url(url: &str) -> std::io::Result<()> {
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(format!("{home}/.local/share/flatpak/exports/share"));
     }
-    for d in [
-        "/var/lib/flatpak/exports/share",
-        "/usr/local/share",
-        "/usr/share",
-    ] {
-        dirs.push(d.to_string());
-    }
+    dirs.extend(
+        ["/var/lib/flatpak/exports/share", "/usr/local/share", "/usr/share"].map(String::from),
+    );
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|d| seen.insert(d.clone()));
 
@@ -87,10 +83,7 @@ fn open_login_url(url: &str) -> std::io::Result<()> {
             if s.success() {
                 Ok(())
             } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("xdg-open exited with {s}"),
-                ))
+                Err(std::io::Error::other(format!("xdg-open exited with {s}")))
             }
         })
 }

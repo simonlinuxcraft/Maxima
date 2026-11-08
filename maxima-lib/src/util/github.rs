@@ -4,19 +4,13 @@ use std::sync::Mutex;
 use std::io::Read;
 
 use crate::util::native::DownloadError;
-use lazy_static::lazy_static;
 use log::info;
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-lazy_static! {
-    // MAXIMA-LINUX-PORT-MOD 2026-06-07: latest in-flight download progress,
-    // published so the launcher UI can show a percentage during the otherwise
-    // silent ~516MB GE-Proton download (the launch flow blocks on this and the
-    // window looks frozen). Holds (label, downloaded_bytes, total_bytes) while
-    // a download is running, None when idle. Read via download_progress().
-    static ref DOWNLOAD_PROGRESS: Mutex<Option<(String, u64, u64)>> = Mutex::new(None);
-}
+// MAXIMA-LINUX-PORT-MOD 2026-06-07: in-flight download progress for the launcher
+// UI, (label, downloaded, total) while a download runs, None when idle.
+static DOWNLOAD_PROGRESS: Mutex<Option<(String, u64, u64)>> = Mutex::new(None);
 
 fn set_download_progress(label: &str, downloaded: u64, total: u64) {
     if let Ok(mut p) = DOWNLOAD_PROGRESS.lock() {
@@ -94,15 +88,9 @@ pub fn fetch_github_release(
 }
 
 pub fn github_download_asset(asset: &GithubAsset, path: &PathBuf) -> Result<(), DownloadError> {
-    // MAXIMA-LINUX-PORT-MOD 2026-06-07: resumable, streamed download.
-    // The old implementation read the whole asset (GE-Proton ~516MB) into a
-    // RAM Vec and only wrote to disk at the very end. On Steam Deck / slow
-    // links the launch flow blocks here with no progress and, if the user
-    // closes the seemingly-frozen window, nothing is persisted, so the next
-    // Play press re-downloads from byte 0 forever (the proton version is only
-    // recorded after extract). This streams to disk in 1MB chunks and resumes
-    // a partially-downloaded file via an HTTP Range request, so interrupted
-    // downloads continue instead of restarting.
+    // MAXIMA-LINUX-PORT-MOD 2026-06-07: stream to disk in 1MB chunks and resume
+    // via HTTP Range. Upstream buffered the whole asset in RAM and wrote it at
+    // the end, so a closed window meant starting the download from byte 0.
     download_with_resume(&asset.browser_download_url, asset.size, path, &asset.name)
 }
 
@@ -174,17 +162,11 @@ fn download_inner(
         return Err(DownloadError::Http(format!("{} {}", status, label)));
     }
 
-    let file = OpenOptions::new().create(true).write(true).open(path)?;
+    let mut file = OpenOptions::new().create(true).write(true).open(path)?;
     let start = if append { resume_from } else { 0 };
-    if append {
-        file.set_len(resume_from)?;
-        let mut f = file;
-        f.seek(SeekFrom::Start(resume_from))?;
-        stream_to_writer(res, BufWriter::with_capacity(1 << 20, f), label, start, expected_size)?;
-    } else {
-        file.set_len(0)?;
-        stream_to_writer(res, BufWriter::with_capacity(1 << 20, file), label, start, expected_size)?;
-    }
+    file.set_len(start)?;
+    file.seek(SeekFrom::Start(start))?;
+    stream_to_writer(res, BufWriter::with_capacity(1 << 20, file), label, start, expected_size)?;
 
     // Verify the final size; a short file means the connection dropped. Leave
     // the partial file in place so the next attempt resumes, but surface an

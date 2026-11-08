@@ -24,7 +24,7 @@ use xz2::read::XzDecoder;
 
 use crate::util::{
     github::{fetch_github_release, github_download_asset, GithubRelease},
-    native::{maxima_dir, DownloadError, NativeError, SafeParent, SafeStr, WineError},
+    native::{maxima_dir, DownloadError, NativeError, SafeStr, WineError},
     registry::RegistryError,
 };
 
@@ -47,7 +47,7 @@ lazy_static! {
     // a hot-switch from the launcher UI.
     static ref LAST_PROTON_LOG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
             // MAXIMA-LINUX-PORT-MOD 2026-06-07: process-lifetime memo of the system
-    // GE-Proton 10.x auto-detection (a ~30-stat scan) so the multiple
+    // Proton auto-detection (a ~30-stat scan) so the multiple
     // resolve_effective_proton_path() calls per launch don't re-scan. Outer
     // Option = "computed yet?", inner Option = the detected path (None = none
     // found / managed proton already present).
@@ -106,22 +106,11 @@ struct Versions {
     umu: String,
 }
 
-/// Returns the auto-managed default wineprefix path. Kept as a separate
-/// helper (introduced 2026-05-26) so future routing changes can distinguish
-/// the canonical Maxima-managed path from whatever `wine_prefix_dir()`
-/// returns at runtime.
-pub fn default_wine_prefix_dir() -> Result<PathBuf, NativeError> {
-    Ok(maxima_dir()?.join("wine/prefix"))
-}
-
-/// Returns internal proton pfx path. Under Option H (the active
-/// custom-proton routing strategy), the wineprefix is ALWAYS the default
-/// Steam-compatdata-linked one even when a custom Proton is active: the
-/// custom-proton swap happens at the `wine/proton` symlink level, not at
-/// the prefix level. Keeps Origin / EA Desktop state shared, avoids the
-/// pressure-vessel wineserver split that broke per-Proton-prefix routing.
+/// The wineprefix. Always the default Steam-compatdata-linked one, also with a
+/// custom Proton: the swap happens at the `wine/proton` symlink, not at the
+/// prefix (Option H). Keeps Origin / EA Desktop state shared.
 pub fn wine_prefix_dir() -> Result<PathBuf, NativeError> {
-    default_wine_prefix_dir()
+    Ok(maxima_dir()?.join("wine/prefix"))
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-05-24: helper that always returns the default
@@ -178,12 +167,10 @@ fn resolve_custom_proton_path() -> Option<PathBuf> {
         }
     }
     let sidecar = maxima_dir().ok()?.join("custom_proton_path");
-    if sidecar.exists() {
-        if let Ok(content) = std::fs::read_to_string(&sidecar) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                return Some(expand_tilde(trimmed));
-            }
+    if let Ok(content) = std::fs::read_to_string(&sidecar) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Some(expand_tilde(trimmed));
         }
     }
     None
@@ -204,16 +191,16 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 // MAXIMA-LINUX-PORT-MOD 2026-06-07: non-persistent auto-detect of a system
-// proton (GE-Proton 10.x/11.x, or proton-cachyos as fallback). On a fresh
+// proton (any GE-Proton series, proton-cachyos, Valve's own builds). On a fresh
 // install (no managed proton downloaded yet, no user-set custom path) this lets
 // the launch flow route wine/proton at an already-present build in the Steam
-// compatibilitytools.d dirs and skip the ~516MB GE-Proton download entirely.
+// compatibilitytools.d dirs and skip the GE-Proton download entirely.
 // Deliberately does NOT write the
 // user custom-proton sidecar, so it never shows up as a user choice in the UI;
 // it flows only through resolve_effective_proton_path() into the existing
 // Option H symlink machinery. Falls back to the (resumable) download when no
 // suitable system proton exists, so behaviour is unchanged on distros without
-// a GE-Proton 10.x present.
+// a usable Proton present.
 fn auto_detect_system_proton() -> Option<PathBuf> {
     if let Ok(guard) = AUTO_PROTON.lock() {
         if let Some(cached) = guard.as_ref() {
@@ -237,9 +224,7 @@ fn auto_detect_system_proton() -> Option<PathBuf> {
 fn proton_tag(path: &Path) -> Option<String> {
     if let Ok(contents) = std::fs::read_to_string(path.join("version")) {
         if let Some(tag) = contents.split_whitespace().last() {
-            if !tag.is_empty() {
-                return Some(tag.to_string());
-            }
+            return Some(tag.to_string());
         }
     }
     path.file_name().and_then(|n| n.to_str()).map(str::to_string)
@@ -274,44 +259,20 @@ fn proton_rank(tag: &str) -> (u32, u32, u32) {
     if tag.to_ascii_lowercase().starts_with("proton-cachyos") {
         return (1, 0, 0);
     }
-    // Everything else a caller offers, including Valve's own builds and anything
-    // released after this code was written. Eligibility is decided by
-    // is_valid_proton_layout(), never by the name: matching names would mean
-    // guessing at every vendor's version string, and a build we failed to
-    // recognise would silently trigger a ~516MB download on a machine that
-    // already had a working Proton.
+    // Everything else, including Valve's own builds: eligibility is decided by
+    // is_valid_proton_layout(), never by the name.
     (0, 0, 0)
 }
 
-fn compute_auto_detect_system_proton() -> Option<PathBuf> {
-    // Only auto-route on a fresh install: if a real managed proton directory
-    // already exists (previously downloaded), keep using it and never displace
-    // it. A symlink at the default path (a prior auto-route) does not count as
-    // "real", so warm launches re-confirm the same system proton.
-    if let Ok(default) = default_proton_dir() {
-        if let Ok(meta) = std::fs::symlink_metadata(&default) {
-            if !meta.file_type().is_symlink() && meta.is_dir() {
-                return None;
-            }
-        }
-        // MAXIMA-LINUX-PORT-MOD 2026-08-12: a managed Proton that is currently
-        // moved aside for a custom-Proton symlink still counts as present.
-        // Restoring it is exactly what clearing the custom path is supposed to
-        // do, so auto-detection must not step in front of it and route at some
-        // other system build instead. Without this a user who once downloaded
-        // the managed Proton could never get back to it while any GE-Proton sat
-        // in compatibilitytools.d.
-        if is_valid_proton_layout(&default.with_extension("maxima-backup")) {
-            return None;
-        }
-    }
-
-    let home = env::var("HOME").ok()?;
-    // (directory, only entries named "Proton*"). The filter exists for
-    // steamapps/common, which holds every installed game: without it this would
-    // stat hundreds of directories on every launch, the kind of full-tree scan
-    // that already caused a stutter once.
-    let roots = [
+// Where a Proton build can live, with "only entries named Proton*" for the
+// steamapps/common roots, which hold every installed game: without the filter
+// this would stat hundreds of directories on every launch. Shared with the
+// launcher's custom-Proton dialog so both see the same places.
+pub fn proton_search_roots() -> Vec<(PathBuf, bool)> {
+    let Ok(home) = env::var("HOME") else {
+        return Vec::new();
+    };
+    let roots: Vec<(String, bool)> = vec![
         (format!("{}/.local/share/Steam/compatibilitytools.d", home), false),
         (format!("{}/.steam/steam/compatibilitytools.d", home), false),
         (format!("{}/.steam/root/compatibilitytools.d", home), false),
@@ -356,6 +317,33 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
             true,
         ),
     ];
+    roots.into_iter().map(|(p, named)| (PathBuf::from(p), named)).collect()
+}
+
+fn compute_auto_detect_system_proton() -> Option<PathBuf> {
+    // Only auto-route on a fresh install: if a real managed proton directory
+    // already exists (previously downloaded), keep using it and never displace
+    // it. A symlink at the default path (a prior auto-route) does not count as
+    // "real", so warm launches re-confirm the same system proton.
+    if let Ok(default) = default_proton_dir() {
+        if let Ok(meta) = std::fs::symlink_metadata(&default) {
+            if !meta.file_type().is_symlink() && meta.is_dir() {
+                return None;
+            }
+        }
+        // MAXIMA-LINUX-PORT-MOD 2026-08-12: a managed Proton that is currently
+        // moved aside for a custom-Proton symlink still counts as present.
+        // Restoring it is exactly what clearing the custom path is supposed to
+        // do, so auto-detection must not step in front of it and route at some
+        // other system build instead. Without this a user who once downloaded
+        // the managed Proton could never get back to it while any GE-Proton sat
+        // in compatibilitytools.d.
+        if is_valid_proton_layout(&default.with_extension("maxima-backup")) {
+            return None;
+        }
+    }
+
+    let roots = proton_search_roots();
 
     // Pick the highest-ranking system proton across all roots: the pinned build
     // first, then any other GE-Proton (newest series wins), then proton-cachyos.
@@ -409,7 +397,7 @@ fn compute_auto_detect_system_proton() -> Option<PathBuf> {
 
 // MAXIMA-LINUX-PORT-MOD 2026-06-07: the proton path that should actually drive
 // routing: an explicit user custom path wins, otherwise an auto-detected
-// system GE-Proton 10.x. Used by ensure_proton_routing / check_wine_validity /
+// system Proton. Used by ensure_proton_routing / check_wine_validity /
 // install_wine so that both override mechanisms share the Option H symlink
 // machinery. resolve_custom_proton_path() (sidecar only) is intentionally left
 // untouched so the launcher UI still reports auto-routing as "not user-set".
@@ -458,10 +446,9 @@ pub fn active_proton_info() -> (String, String, String) {
 }
 
 // MAXIMA-LINUX-PORT-MOD: true when a Proton build is already on disk, so a
-// launch can proceed without the ~516MB managed GE-Proton download. Covers all
+// launch can proceed without the managed GE-Proton download. Covers all
 // three no-download sources: a custom path/sidecar, an auto-detected system
-// GE-Proton 10.x, or a managed GE-Proton already extracted into the default
-// dir. The Non-Steam standalone-prefix path gates on this to fail clean
+// Proton, or a managed GE-Proton already extracted into the default dir. The Non-Steam standalone-prefix path gates on this to fail clean
 // ("set KYBER_PROTON_PATH") instead of kicking off a cold download that stalls
 // on a Steam Deck.
 pub fn proton_resolvable_without_download() -> bool {
@@ -469,10 +456,9 @@ pub fn proton_resolvable_without_download() -> bool {
         return true;
     }
     // Or the Option-H routing point already resolves to a valid Proton: a
-    // managed GE-Proton extracted there, OR a prior routing symlink pointing at
-    // a real Proton build (e.g. compatibilitytools.d/Proton-GE Latest whose name
-    // the GE-Proton10 auto-detect does not match). is_valid_proton_layout follows
-    // the symlink, so both cases are caught without a download.
+    // managed GE-Proton extracted there, or a prior routing symlink pointing at
+    // a real build. is_valid_proton_layout follows the symlink, so both cases
+    // are caught without a download.
     default_proton_dir()
         .map(|p| is_valid_proton_layout(&p))
         .unwrap_or(false)
@@ -533,9 +519,7 @@ pub fn ensure_proton_routing() -> Result<(), NativeError> {
     // the UI before ever launching BF2 has no wine/ dir yet, so the symlink would
     // otherwise fail with a bare "No such file or directory (os error 2)" on save.
     if let Some(parent) = proton.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
+        fs::create_dir_all(parent)?;
     }
 
     match resolve_effective_proton_path() {
@@ -566,10 +550,8 @@ pub fn ensure_proton_routing() -> Result<(), NativeError> {
                         );
                         return Err(NativeError::Io(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "wine/proton is a directory and wine/proton.maxima-backup also \
-                                 exists; refusing to overwrite. Move one of them aside manually."
-                            ),
+                            "wine/proton is a directory and wine/proton.maxima-backup also \
+                             exists; refusing to overwrite. Move one of them aside manually.",
                         )));
                     }
                     info!(
@@ -662,12 +644,16 @@ fn umu_steamrt3_dir() -> Option<PathBuf> {
     Some(base.join("umu").join("steamrt3"))
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name).map(|v| v == "1").unwrap_or(false)
+}
+
 // MAXIMA-LINUX-PORT-MOD (6.4.4): Steam Deck / SteamOS detection, mirrors the
 // signals umu-wrapper.sh already uses (_kyber_is_deck). An explicit Deck signal
 // is required so a normal Arch box (SteamOS 3 is Arch-based) is never matched.
 #[cfg(target_os = "linux")]
 fn is_steam_deck() -> bool {
-    if env::var("SteamDeck").map(|v| v == "1").unwrap_or(false) {
+    if env_flag("SteamDeck") {
         return true;
     }
     if env::var_os("SteamOS").is_some() {
@@ -877,10 +863,9 @@ pub(crate) async fn check_wine_validity() -> Result<bool, NativeError> {
     // active, skip the version comparison against GE-Proton's GitHub release
     // entirely. The user has opted out of auto-management, so neither
     // dependency-versions.toml nor the upstream release tag are relevant.
-    // Layout check has already happened inside proton_dir() (returns Err if
-    // invalid), so reaching this point means the path is good. resolve_effective
-    // also covers an auto-detected system GE-Proton 10.x, which is likewise not
-    // version-managed against the GitHub release.
+    // The layout was checked by ensure_proton_routing() / install_wine(), and
+    // an auto-detected system Proton is likewise not version-managed against
+    // the GitHub release.
     if resolve_effective_proton_path().is_some() {
         return Ok(proton_dir().is_ok());
     }
@@ -891,7 +876,7 @@ pub(crate) async fn check_wine_validity() -> Result<bool, NativeError> {
 
     // MAXIMA-LINUX-PORT-MOD 2026-08-15: any managed build that recorded a version
     // counts as installed. Demanding an exact match against the pin sent a
-    // working GE-Proton through a ~516MB re-download for nothing but a version
+    // working GE-Proton through a re-download for nothing but a version
     // number; the pin decides what a fresh install fetches, not what an existing
     // install has to be. The directory itself was already checked above, so an
     // empty version is the only thing left that means "nothing installed yet".
@@ -1082,9 +1067,7 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     // which then adds only libgamemodeauto.so before exec'ing umu-run, so
     // umu-run still sees no inherited host preloads, just gamemode's own.
     let use_gamemode = matches!(command_type, CommandType::WaitForExitAndRun)
-        && !env::var("KYBER_DISABLE_GAMEMODE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        && !env_flag("KYBER_DISABLE_GAMEMODE")
         && gamemoderun_in_path();
 
     // Create command with all necessary wine env variables
@@ -1152,10 +1135,7 @@ pub async fn run_wine_command<I: IntoIterator<Item = T>, T: AsRef<OsStr>>(
     // the launch flow completes. PROTON_DLL_OVERRIDES is the umu/Proton
     // friendly variant that gets merged with the Proton built-in
     // overrides rather than replacing them.
-    if env::var("KYBER_DISABLE_WINEGSTREAMER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if env_flag("KYBER_DISABLE_WINEGSTREAMER") {
         child = child.env("PROTON_DLL_OVERRIDES", "winegstreamer=d");
     }
 
@@ -1281,7 +1261,7 @@ pub(crate) async fn install_wine() -> Result<(), NativeError> {
     }
 
     // MAXIMA-LINUX-PORT-MOD 2026-06-07: no user custom path, but a system
-    // GE-Proton 10.x was auto-detected (already layout-validated): route to it
+    // Proton was auto-detected (already layout-validated): route to it
     // and skip the download. Unlike the user-custom branch this never hard-
     // errors; if detection ever returns a bad path we simply fall through to
     // the download below.
@@ -1513,31 +1493,6 @@ fn verify_registry_files_for_bf2() -> bool {
         }
     }
     true
-}
-
-// JIT subset: only the four keys BF2 reads at entitlement-check time, all
-// in user.reg. Used by lock_locale_just_in_time, where a wineserver is
-// almost always running (the bootstrap started it), so unlike the full
-// pre-flight this one intentionally has no wineserver gate: if the file
-// still shows the locked state, nothing re-initialised the prefix since
-// setup_wine_registry ran and the re-write is redundant.
-fn verify_locale_files_for_bf2() -> bool {
-    let prefix = match wine_prefix_dir() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let user = match std::fs::read_to_string(prefix.join("user.reg")) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    [
-        (r"Control Panel\\International", "Locale", "00000409"),
-        (r"Control Panel\\International", "LocaleName", "en-US"),
-        (r"Control Panel\\International", "sLanguage", "ENU"),
-        (r"Software\\Valve\\Steam", "language", "english"),
-    ]
-    .iter()
-    .all(|(section, name, value)| reg_file_section_has_value(&user, section, name, value))
 }
 
 /// Each `reg add` invocation is routed through the same wine command
@@ -1776,84 +1731,6 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
     Ok(())
 }
 
-/// Just-in-time re-write of the locale-critical keys, run *immediately*
-/// before the BF2 spawn, after the full `setup_wine_registry()` block
-/// but separated by license/cloud-sync/protonfix activity that may
-/// re-initialise parts of the prefix and clobber Steam-language /
-/// International values.
-///
-/// Subset of `setup_wine_registry` ENTRIES: only the four keys BF2 reads
-/// at entitlement-check time. Idempotent and fast (`reg add /f` overwrites
-/// in place).
-pub async fn lock_locale_just_in_time() -> Result<(), NativeError> {
-    type RegEntry = (&'static str, &'static str, &'static str, &'static str);
-    const CRITICAL: &[RegEntry] = &[
-        (r"HKCU\Control Panel\International", "Locale", "00000409", "/reg:64"),
-        (r"HKCU\Control Panel\International", "LocaleName", "en-US", "/reg:64"),
-        (r"HKCU\Control Panel\International", "sLanguage", "ENU", "/reg:64"),
-        (r"HKCU\Software\Valve\Steam", "language", "english", "/reg:64"),
-    ];
-
-    // MAXIMA-LINUX-PORT-MOD (6.4.3): file pre-flight, deliberately without a
-    // wineserver gate (the bootstrap has one running at this point, so a gate
-    // would never pass). The JIT re-write exists to undo prefix re-inits that
-    // clobber the locale keys between setup_wine_registry and the BF2 spawn;
-    // if user.reg still shows the locked state, no clobber happened and the
-    // re-write is redundant. On the Deck the 4 reg adds would otherwise hang
-    // ~5min each.
-    if verify_locale_files_for_bf2() {
-        log::info!(
-            "lock_locale_just_in_time: user.reg already locked to en-US \
-             (file pre-flight) - skipping {} reg adds",
-            CRITICAL.len()
-        );
-        return Ok(());
-    }
-
-    log::info!(
-        "lock_locale_just_in_time: re-writing {} critical keys before BF2 spawn",
-        CRITICAL.len()
-    );
-
-    let mut failures: Vec<&str> = Vec::new();
-    for (key, name, data, view) in CRITICAL {
-        let result = run_wine_command(
-            "reg",
-            Some(vec!["add", key, "/v", name, view, "/d", data, "/f"]),
-            None,
-            false,
-            CommandType::Run,
-        )
-        .await;
-        if let Err(err) = result {
-            log::error!(
-                "JIT reg add FAILED [{}] {}={} ({}): {err}",
-                key,
-                name,
-                data,
-                view,
-            );
-            failures.push(name);
-        } else {
-            log::debug!("JIT reg add OK: [{}] {}={}", key, name, data);
-        }
-    }
-
-    if !failures.is_empty() {
-        log::warn!(
-            "lock_locale_just_in_time: {}/{} keys failed to re-write: {:?}. \
-             BF2 may abort with the language-entitlement error.",
-            failures.len(),
-            CRITICAL.len(),
-            failures,
-        );
-    } else {
-        log::info!("lock_locale_just_in_time: all {} keys re-written", CRITICAL.len());
-    }
-
-    Ok(())
-}
-
 /// Probe what BF2 would actually see when it queries the locale-critical
 /// keys. Logs the live values of the four most-important keys and warns
 /// if any look German/host-locale-derived. Best-effort: a `reg query`
@@ -1861,12 +1738,9 @@ pub async fn lock_locale_just_in_time() -> Result<(), NativeError> {
 /// than aborting the launch.
 ///
 /// Returns `true` only if all four critical keys resolved cleanly and
-/// each value contained the expected English token. Callers use this
-/// as a fast pre-flight to skip the expensive `setup_wine_registry()`
-/// and `lock_locale_just_in_time()` paths when the prefix is already
-/// in the desired state, typically the case on warm launches where
-/// nothing tampered with the registry between sessions. Saves ~50s
-/// per warm launch (15 reg-add calls @ ~3s each via umu-run).
+/// each value contained the expected English token. `setup_wine_registry()`
+/// uses this as a pre-flight to skip its 15 reg adds on warm launches
+/// (~3s each via umu-run).
 pub async fn verify_locale_is_english() -> bool {
     type ProbeKey = (&'static str, &'static str, &'static str);
     const PROBES: &[ProbeKey] = &[
@@ -1981,26 +1855,12 @@ async fn parse_wine_registry(file_path: &str) -> WineRegistry {
 }
 
 pub async fn parse_mx_wine_registry() -> Result<WineRegistry, NativeError> {
-    // MAXIMA-LINUX-PORT-MOD 2026-05-26: when a custom Proton is active and the
-    // per-Proton wineprefix has not been initialised yet (first launch, no
-    // system.reg yet), fall back to the default prefix's system.reg. The
-    // registry entries we look up here (BF2 install path, EA Games catalog,
-    // EA Desktop install state) are environment-level facts seeded by Steam
-    // into the default Steam-compatdata-linked prefix and apply identically
-    // regardless of which Proton runs the game. Without this fallback,
-    // is_installed() returns false on the first launch with a fresh custom
-    // prefix and the launcher shows "Game not installed".
-    let primary_path = wine_prefix_dir()?.join("system.reg");
-    let path = if primary_path.exists() {
-        primary_path
-    } else {
-        let fallback = default_wine_prefix_dir()?.join("system.reg");
-        if fallback.exists() {
-            fallback
-        } else {
-            return Ok(HashMap::new());
-        }
-    };
+    // MAXIMA-LINUX-PORT-MOD: no system.reg yet (first launch) means an empty
+    // registry, not an error, otherwise the launcher shows "Game not installed".
+    let path = wine_prefix_dir()?.join("system.reg");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
 
     Ok(parse_wine_registry(path.safe_str()?).await)
 }

@@ -36,6 +36,8 @@ use std::{collections::HashMap, env, fs};
 use crate::unix::fs::case_insensitive_path;
 
 use super::native::{module_path, NativeError, SafeParent, SafeStr};
+#[cfg(target_os = "linux")]
+use super::native::bundled_helper_path;
 
 #[cfg(target_pointer_width = "64")]
 pub const REG_ARCH_PATH: &str = "SOFTWARE\\WOW6432Node";
@@ -526,10 +528,6 @@ pub fn read_game_path(name: &str) -> Result<PathBuf, RegistryError> {
     )))
 }
 
-#[cfg(target_os = "macos")]
-pub fn read_game_path(_name: &str) -> Result<PathBuf, RegistryError> {
-    todo!("read_game_path is not implemented on macOS");
-}
 
 #[cfg(target_os = "linux")]
 fn slug_to_steam_appid(slug: &str) -> Option<u32> {
@@ -568,10 +566,6 @@ pub(crate) fn steam_root_candidates() -> Vec<PathBuf> {
         roots.push(home.join(".local/share/Steam"));
     }
 
-    // 5. User-configured external library root mirrored from
-    // linux_setup.rs hardcoded fallback.
-    roots.push(PathBuf::from("/mnt/Games/SteamLibrary"));
-
     roots
 }
 
@@ -591,52 +585,35 @@ pub(crate) fn steam_root_candidates() -> Vec<PathBuf> {
 /// ```
 #[cfg(target_os = "linux")]
 pub(crate) fn parse_libraryfolders_vdf(text: &str) -> Vec<PathBuf> {
-    use regex::Regex;
-    lazy_static::lazy_static! {
-        static ref PATH_RE: Regex =
-            Regex::new(r#""path"\s+"((?:[^"\\]|\\.)*)""#).unwrap();
-    }
-    PATH_RE
-        .captures_iter(text)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str()))
-        .map(|raw| raw.replace("\\\\", "\\"))
-        .map(PathBuf::from)
-        .collect()
+    vdf_values(text, "path").map(PathBuf::from).collect()
+}
+
+/// All values of `"<key>" "<value>"` lines in a Valve KeyValues file, with the
+/// `\\` escaping undone.
+#[cfg(target_os = "linux")]
+fn vdf_values<'a>(text: &'a str, key: &str) -> impl Iterator<Item = String> + 'a {
+    let re = regex::Regex::new(&format!(r#""{key}"\s+"((?:[^"\\]|\\.)*)""#)).unwrap();
+    re.captures_iter(text)
+        .filter_map(|cap| cap.get(1).map(|m| m.as_str().replace("\\\\", "\\")))
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 /// Extracts the `installdir` value from a Steam appmanifest .acf file,
 /// e.g. `appmanifest_1237950.acf`.
 #[cfg(target_os = "linux")]
 fn parse_appmanifest_acf(text: &str) -> Option<String> {
-    use regex::Regex;
-    lazy_static::lazy_static! {
-        static ref INSTALLDIR_RE: Regex =
-            Regex::new(r#""installdir"\s+"((?:[^"\\]|\\.)*)""#).unwrap();
-    }
-    INSTALLDIR_RE
-        .captures(text)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().replace("\\\\", "\\"))
+    vdf_values(text, "installdir").next()
 }
 
-#[cfg(unix)]
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn read_game_path(_name: &str) -> Result<PathBuf, RegistryError> {
-    todo!("Cannot read game path on this unix variant");
+    todo!("read_game_path is only implemented for Linux and Windows");
 }
 
 #[cfg(target_os = "linux")]
 pub fn bootstrap_path() -> Result<PathBuf, NativeError> {
-    // Launcher FFI (kyber_launcher in bundle/) points /proc/self/exe at
-    // bundle/, bootstrap sits in bundle/cli/. CLI (kyber_cli in
-    // bundle/cli/) has bootstrap right next to it.
-    let exe = module_path()?;
-    let base = exe.safe_parent()?;
-    let cli_subdir = base.join("cli").join("maxima-bootstrap");
-    if cli_subdir.exists() {
-        return Ok(cli_subdir);
-    }
-    Ok(base.join("maxima-bootstrap"))
+    bundled_helper_path("maxima-bootstrap")
 }
 
 #[cfg(target_os = "macos")]

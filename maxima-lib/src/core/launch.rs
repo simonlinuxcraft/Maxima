@@ -113,15 +113,10 @@ impl LaunchMode {
 pub struct ActiveGameContext {
     launch_id: String,
     game_path: String,
-    /// MAXIMA-LINUX-PORT-MOD: Name of the game executable file (e.g.
-    /// `starwarsbattlefrontii.exe`). On Linux/umu the launcher process tree
-    /// re-execs through python3/bwrap/proton; the only stable way to find
-    /// the Wine PID is to ask `wine-helper.exe get_pid <exe_filename>` with
-    /// the original Windows-side .exe name. Walking `/proc/<pid>/cmdline`
-    /// of the matched MXLaunchId process is racy because by the time LSX
-    /// connects, the process may have already re-exec'd and the exe arg
-    /// is gone from argv. Threading the filename through here keeps it
-    /// deterministic.
+    /// MAXIMA-LINUX-PORT-MOD: the game's .exe name (`starwarsbattlefrontii.exe`),
+    /// frozen at spawn time. umu-run re-execs through python3/bwrap/proton, so
+    /// by the time LSX connects the name is gone from argv; `wine-helper.exe
+    /// get_pid` needs it to find the Wine PID.
     game_exe_filename: String,
     content_id: String,
     offer: Option<OwnedOffer>,
@@ -285,12 +280,8 @@ pub async fn start_game(
     };
 
     let dir = path.safe_parent()?.safe_str()?;
-    // MAXIMA-LINUX-PORT-MOD: capture the .exe filename BEFORE `path` is
-    // shadowed below. This name (e.g. starwarsbattlefrontii.exe) is what
-    // wine-helper.exe needs to look up the game's Wine PID. Walking
-    // /proc/<pid>/cmdline of the MXLaunchId-tagged Linux process is racy:
-    // umu-run re-execs through python3 / bwrap / proton and by the time
-    // LSX connects the original .exe path may already be gone from argv.
+    // MAXIMA-LINUX-PORT-MOD: capture the .exe filename before `path` is
+    // shadowed below, see ActiveGameContext::game_exe_filename.
     let game_exe_filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -407,23 +398,20 @@ pub async fn start_game(
         // captures Proton/Wine output into last-game-launch.log. Default-on for
         // this build; KYBER_GAME_LOG=0 disables. Relying on env inheritance from
         // the launcher proved unreliable (the file was never written).
-        .env(
-            "KYBER_GAME_LOG",
-            std::env::var("KYBER_GAME_LOG").unwrap_or_else(|_| "1".to_string()),
-        )
+        .env("KYBER_GAME_LOG", env_or("KYBER_GAME_LOG", "1"))
         .env("EAAuthCode", "unavailable")
         .env("EAEgsProxyIpcPort", "0")
         // MAXIMA-LINUX-PORT-MOD: read entitlement source from env so the
         // Launcher's in-process FFI path can override to STEAM via set_var().
-        .env("EAEntitlementSource", std::env::var("EAEntitlementSource").unwrap_or_else(|_| "EA".to_string()))
-        .env("EAExternalSource", std::env::var("EAExternalSource").unwrap_or_else(|_| "EA".to_string()))
+        .env("EAEntitlementSource", env_or("EAEntitlementSource", "EA"))
+        .env("EAExternalSource", env_or("EAExternalSource", "EA"))
         .env("EAFreeTrialGame", "false")
         // MAXIMA-LINUX-PORT-MOD: read game locale from env so the FFI path
         // can override to en_US (German system locale causes entitlement error).
-        .env("EAGameLocale", std::env::var("EAGameLocale").unwrap_or_else(|_| maxima.locale.full_str().to_string()))
+        .env("EAGameLocale", env_or("EAGameLocale", maxima.locale.full_str()))
         .env("EAGenericAuthToken", access_token.to_owned())
         .env("EALaunchCode", "unavailable")
-        .env("EALaunchOwner", std::env::var("EALaunchOwner").unwrap_or_else(|_| "EA".to_string()))
+        .env("EALaunchOwner", env_or("EALaunchOwner", "EA"))
         .env(
             "EALaunchEAID",
             user.player()
@@ -464,49 +452,23 @@ pub async fn start_game(
         }
     };
 
-    // MAXIMA-LINUX-PORT-MOD: pre-spawn verify is intentionally NOT run here.
-    // The pre-flight verify inside `setup_wine_registry()` (called from
-    // `mx_linux_setup()` at the top of this fn) already established that
-    // the four locale-critical keys hold the expected English values.
-    // License-fetch / cloud-sync between that verify and this spawn point
-    // do not touch Wine registry, so a second 4-key probe (~14s of umu-run
-    // overhead via reg query) is pure waste on the happy path.
-    //
-    // If the language-entitlement error ever returns the recovery path is
-    // to re-introduce a one-key probe of `HKCU\Software\Valve\Steam\language`
-    // here (the only key Steam itself sometimes overwrites between launches)
-    // and conditionally call `lock_locale_just_in_time()` on mismatch.
+    // MAXIMA-LINUX-PORT-MOD: no locale probe before the spawn. setup_wine_registry()
+    // already verified the four keys and nothing between there and here touches
+    // the Wine registry.
 
-    // MAXIMA-LINUX-PORT-MOD: give the game its own UTS namespace whose
-    // hostname is "localhost" when the machine hostname maps to a loopback
-    // address other than 127.0.0.1 (127.0.1.1 on Debian, Ubuntu and other
-    // installers). A hosted listen server resolves itself by name, and with
-    // that mismatch the reply arrives from an address the client never
-    // connected to, so the local link never establishes and the game dies
-    // during the ingame transition. See unix/host_namespace.rs.
-    //
-    // MAXIMA-LINUX-PORT-MOD 2026-08-15: opt-in instead of opt-out. Shipping this
-    // on by default in 6.4.12 broke launching outright on Ubuntu 26.04: the game
-    // spawned into the namespace, never connected back over LSX and never
-    // exited, so the launcher sat in "Starting Game..." forever. Two user logs
-    // show it cleanly, 7 launches with the namespace and not one reaching the
-    // DLL handshake, while every launch without it did. The trigger is the
-    // 127.0.1.1 line Debian and Ubuntu write by default, so it hit those users
-    // on every join even though only hosting needs the workaround.
-    //
-    // Why it hangs there is still unknown; X11 auth, bwrap under
-    // apparmor_restrict_unprivileged_userns=1 and a real Proton wine were all
-    // reproduced fine inside the namespace on 24.04. Until that is understood
-    // the launch path does not carry it. Hosts on affected systems get the
-    // one-off /etc/hosts fix from HostLoopbackWarning again, which is what they
-    // had before 6.4.12. KYBER_ENABLE_HOST_NAMESPACE=1 turns it back on for
-    // anyone diagnosing this.
+    // MAXIMA-LINUX-PORT-MOD: own UTS namespace with hostname "localhost" for
+    // hosting on systems whose hostname maps to 127.0.1.1 (Debian, Ubuntu), see
+    // unix/host_namespace.rs. Opt-in since 2026-08-15: on by default in 6.4.12
+    // it broke every launch on Ubuntu 26.04 (game never reached the DLL
+    // handshake, cause still unknown). Hosts get the /etc/hosts hint from
+    // HostLoopbackWarning instead; KYBER_ENABLE_HOST_NAMESPACE=1 turns this on.
     #[cfg(target_os = "linux")]
-    if env::var("KYBER_ENABLE_HOST_NAMESPACE")
+    let use_host_namespace = env::var("KYBER_ENABLE_HOST_NAMESPACE")
         .map(|v| v == "1")
         .unwrap_or(false)
-        && crate::unix::host_namespace::hostname_is_mismatched_loopback()
-    {
+        && crate::unix::host_namespace::hostname_is_mismatched_loopback();
+    #[cfg(target_os = "linux")]
+    if use_host_namespace {
         info!("Hostname does not resolve to 127.0.0.1, giving the game its own hostname so hosting works");
         let plan = crate::unix::host_namespace::NamespacePlan::new();
         // Safety: the closure only performs raw syscalls and never allocates.
@@ -520,22 +482,18 @@ pub async fn start_game(
     // surface as a LaunchError, not panic the tokio worker.
     let child = child.spawn().map_err(|e| LaunchError::Native(e.into()))?;
 
-    // MAXIMA-LINUX-PORT-MOD: report whether the game really ended up in its own
-    // UTS namespace. The work happens between fork and exec where nothing can
-    // be logged, and a silent no-op here looks exactly like a working fix.
+    // MAXIMA-LINUX-PORT-MOD: the namespace work happens between fork and exec
+    // where nothing can be logged, so check afterwards that it really applied.
     #[cfg(target_os = "linux")]
-    if let Some(pid) = child.id() {
-        match (
-            std::fs::read_link("/proc/self/ns/uts"),
-            std::fs::read_link(format!("/proc/{pid}/ns/uts")),
-        ) {
-            (Ok(ours), Ok(theirs)) if ours != theirs => {
+    if use_host_namespace {
+        if let Some(pid) = child.id() {
+            let ours = std::fs::read_link("/proc/self/ns/uts").ok();
+            let theirs = std::fs::read_link(format!("/proc/{pid}/ns/uts")).ok();
+            if ours.is_some() && ours != theirs {
                 info!("Game runs in its own hostname namespace");
+            } else {
+                warn!("Game still shares the launcher hostname namespace");
             }
-            (Ok(_), Ok(_)) => {
-                info!("Game shares the launcher hostname namespace");
-            }
-            _ => {}
         }
     }
 
@@ -693,4 +651,8 @@ mod tests {
             "second scan within the interval must be skipped"
         );
     }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }

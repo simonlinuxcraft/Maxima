@@ -16,8 +16,7 @@
 
 use std::io;
 
-const CLONE_NEWUSER: libc::c_int = 0x1000_0000;
-const CLONE_NEWUTS: libc::c_int = 0x0400_0000;
+use libc::{CLONE_NEWUSER, CLONE_NEWUTS};
 const LOCALHOST: &[u8] = b"localhost";
 
 /// Whether the machine hostname resolves to a loopback address that is not

@@ -13,10 +13,50 @@ The intent is to upstream every change here as a pull request to
 authoritative log of local divergence.
 
 A second copy of this Maxima tree lives at
-`Kyber/CLI/ThirdParty/Maxima/`; the LSX patches below are kept
-byte-identical between the two trees, while the `wine.rs` refactor
-and the `flate2` pin are currently Launcher-tree only (see entries
-below).
+`Kyber/CLI/ThirdParty/Maxima/`. Both submodules point at the same
+commit of the `linux-port-patches` branch, so the trees are identical.
+
+---
+
+## 2026-11-08: Cleanup of the Linux-port additions
+
+Removes code that nothing calls any more and merges a few duplicated
+helpers. No behaviour change intended, except where noted.
+
+**Files touched**
+- `maxima-lib/src/unix/wine.rs`
+  - Removed `lock_locale_just_in_time()` and `verify_locale_files_for_bf2()`.
+    The pre-spawn call was dropped on 2026-05-09 (see the verify-first entry
+    below) and nothing else used them.
+  - `default_wine_prefix_dir()` folded into `wine_prefix_dir()`; both
+    returned the same path since Option H.
+  - `parse_mx_wine_registry()` no longer falls back to a second prefix path,
+    the fallback was the same path.
+  - New `proton_search_roots()` so the launcher's custom-Proton dialog scans
+    the same directories as the auto-detection (it was missing
+    `~/.steam/root/compatibilitytools.d`).
+  - Small `env_flag()` helper for the `KYBER_*=1` switches.
+- `maxima-lib/src/util/registry.rs`
+  - Dropped the hardcoded `/mnt/Games/SteamLibrary` root (a developer
+    machine path). Extra libraries come from `libraryfolders.vdf` or
+    `STEAM_LIBRARY_ROOT`.
+  - One `vdf_values()` helper for the two KeyValues regexes; the two
+    `todo!()` stubs for non-Linux unix became one.
+- `maxima-lib/src/util/native.rs`: new `bundled_helper_path()`, replaces
+  three copies of the "cli/<name>, else <name>" lookup
+  (`background_service_nix.rs`, `registry.rs`).
+- `maxima-lib/src/core/launch.rs`: `env_or()` for the `EA*` overrides; the
+  UTS-namespace check after spawn only runs when the namespace was
+  requested (it logged "shares the launcher namespace" on every start).
+- `maxima-lib/src/util/github.rs`: `DOWNLOAD_PROGRESS` is a plain
+  `static Mutex` (`Mutex::new` is const), lazy_static no longer needed here.
+- `maxima-lib/src/unix/host_namespace.rs`: `CLONE_*` constants from libc.
+- `maxima-lib/src/core/auth/login.rs`: `io::Error::other`.
+- `maxima-lib/Cargo.toml`: `rust-version` 1.82, matching `Option::is_none_or`
+  which the code already used.
+
+**Upstream tracking**
+Local-only.
 
 ---
 
@@ -258,14 +298,10 @@ The `.reg` + `regedit` approach was unreliable on Linux:
    and BF2's entitlement check aborted launch with "The title is
    installed in a language that you are not entitled to play".
 
-This refactor currently lives in the Launcher-tree copy of Maxima
-only; the CLI-tree copy retains the original `setup_wine_registry`.
-Synchronisation between the two trees is pending verification that
-the refactor does not regress the CLI launch path.
+Both trees carry this refactor since the submodules were unified.
 
 **Upstream tracking**
-Will be offered upstream once verified against the CLI path. The
-refactor is portable across both trees in principle.
+Not offered upstream yet.
 
 ---
 
@@ -274,8 +310,6 @@ refactor is portable across both trees in principle.
 **Files touched**
 - `maxima-lib/Cargo.toml` (line 45)
   - Pinned `flate2 = { version = "=1.0.28", ... }` (exact version)
-  - The CLI-tree copy still uses `flate2 = { version = "1.0.28", ... }`
-    (semver-compatible range)
 
 **Why**
 Cargo's resolver, combined with the workspace-level
@@ -283,11 +317,6 @@ Cargo's resolver, combined with the workspace-level
 override, occasionally pulled a newer minor version of flate2 into
 the Launcher build, breaking the patched-fork compatibility. Pinning
 to the exact `=1.0.28` version stabilised the resolved graph.
-
-The CLI-tree copy was not pinned because its build path resolves the
-workspace patch differently and did not exhibit the issue. The
-divergence is intentional but should be reconciled when the trees
-are merged.
 
 **Upstream tracking**
 Local-only; the upstream Maxima Cargo.toml does not have this pin,

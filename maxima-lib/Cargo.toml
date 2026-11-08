@@ -10,7 +10,7 @@ license = "GPL-3.0"
 readme = "README.md"
 repository = "https://github.com/ArmchairDevelopers/Maxima"
 documentation = "https://docs.rs/maxima"
-rust-version = "1.81.0"
+rust-version = "1.82.0"
 
 [dependencies]
 tokio = { version = "1.28.2", features = [
