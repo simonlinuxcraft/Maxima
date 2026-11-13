@@ -23,7 +23,10 @@ use tokio::{
 use xz2::read::XzDecoder;
 
 use crate::util::{
-    github::{fetch_github_release, github_download_asset, GithubRelease},
+    github::{
+        clear_download_progress, fetch_github_release, github_download_asset,
+        set_download_progress, GithubRelease,
+    },
     native::{maxima_dir, DownloadError, NativeError, SafeStr, WineError},
     registry::RegistryError,
 };
@@ -953,8 +956,33 @@ pub(crate) async fn install_runtime(
         return Err(NativeError::Download(DownloadError::Http(key.to_string())));
     }
 
+    // MAXIMA-LINUX-PORT-MOD: read in chunks so the start dialog can show MB.
+    crate::core::launch::set_launch_step(if key == "umu" {
+        "Installing the umu runtime"
+    } else {
+        "Installing the EAC runtime"
+    });
+    let total = res
+        .header("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let mut body: Vec<u8> = vec![];
-    res.into_reader().read_to_end(&mut body)?;
+    let mut reader = res.into_reader();
+    let mut chunk = vec![0u8; 1 << 20];
+    let read = loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                body.extend_from_slice(&chunk[..n]);
+                set_download_progress(key, body.len() as u64, total);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
+        }
+    };
+    // Cleared on errors too, or the next launch would show a stale bar.
+    clear_download_progress();
+    read?;
 
     if path.exists() {
         remove_dir_all(&path)?;
@@ -1623,6 +1651,9 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         "language",
     ];
 
+    // MAXIMA-LINUX-PORT-MOD: also replaces a finished runtime install step.
+    crate::core::launch::set_launch_step("Checking the Wine registry");
+
     // MAXIMA-LINUX-PORT-MOD (6.4.3): file-based pre-flight first. When no
     // wineserver is running, user.reg/system.reg are authoritative (Wine only
     // diverges from them while a server holds the registry in memory) and the
@@ -1642,13 +1673,11 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
     // MAXIMA-LINUX-PORT-MOD: the first umu call below creates the prefix and,
     // on a fresh install, downloads the Steam runtime before that.
     #[cfg(target_os = "linux")]
-    crate::core::launch::set_launch_step(if umu_steamrt3_dir().is_some_and(|d| !d.exists()) {
-        "Downloading the Steam runtime (first launch only)"
+    if umu_steamrt3_dir().is_some_and(|d| !d.exists()) {
+        crate::core::launch::set_launch_step("Downloading the Steam runtime (first launch only)");
     } else if !wine_prefix_dir()?.join("system.reg").exists() {
-        "Preparing the Wine prefix (first launch only)"
-    } else {
-        "Checking the Wine registry"
-    });
+        crate::core::launch::set_launch_step("Preparing the Wine prefix (first launch only)");
+    }
 
     // Pre-flight: skip the expensive 15-reg-add loop entirely if a quick
     // 4-key verify shows the locale-critical state is already correct.

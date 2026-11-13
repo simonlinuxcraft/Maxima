@@ -12,13 +12,13 @@ use serde::Deserialize;
 // UI, (label, downloaded, total) while a download runs, None when idle.
 static DOWNLOAD_PROGRESS: Mutex<Option<(String, u64, u64)>> = Mutex::new(None);
 
-fn set_download_progress(label: &str, downloaded: u64, total: u64) {
+pub(crate) fn set_download_progress(label: &str, downloaded: u64, total: u64) {
     if let Ok(mut p) = DOWNLOAD_PROGRESS.lock() {
         *p = Some((label.to_string(), downloaded, total));
     }
 }
 
-fn clear_download_progress() {
+pub(crate) fn clear_download_progress() {
     if let Ok(mut p) = DOWNLOAD_PROGRESS.lock() {
         *p = None;
     }
