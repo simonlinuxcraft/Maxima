@@ -1639,6 +1639,17 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
         return Ok(());
     }
 
+    // MAXIMA-LINUX-PORT-MOD: the first umu call below creates the prefix and,
+    // on a fresh install, downloads the Steam runtime before that.
+    #[cfg(target_os = "linux")]
+    crate::core::launch::set_launch_step(if umu_steamrt3_dir().is_some_and(|d| !d.exists()) {
+        "Downloading the Steam runtime (first launch only)"
+    } else if !wine_prefix_dir()?.join("system.reg").exists() {
+        "Preparing the Wine prefix (first launch only)"
+    } else {
+        "Checking the Wine registry"
+    });
+
     // Pre-flight: skip the expensive 15-reg-add loop entirely if a quick
     // 4-key verify shows the locale-critical state is already correct.
     // Each reg.exe spawn round-trips through umu-run + pressure-vessel
@@ -1667,7 +1678,12 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
 
     let mut failures: Vec<&str> = Vec::new();
     let mut critical_failures: Vec<&str> = Vec::new();
-    for (key, name, data, view) in ENTRIES {
+    for (i, (key, name, data, view)) in ENTRIES.iter().enumerate() {
+        crate::core::launch::set_launch_step(&format!(
+            "Writing the Wine registry ({}/{})",
+            i + 1,
+            ENTRIES.len()
+        ));
         // Place /reg:VIEW *before* /f. Some Wine versions of reg.exe accept
         // the trailing form, others ignore the view selector silently and
         // write to the wrong hive.

@@ -35,6 +35,19 @@ use crate::unix::fs::case_insensitive_path;
 
 use serde::{Deserialize, Serialize};
 
+// MAXIMA-LINUX-PORT-MOD: what the launch is doing right now, shown in the start dialog.
+static LAUNCH_STEP: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn set_launch_step(step: &str) {
+    if let Ok(mut s) = LAUNCH_STEP.lock() {
+        *s = step.to_owned();
+    }
+}
+
+pub fn launch_step() -> String {
+    LAUNCH_STEP.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
 #[derive(Error, Debug)]
 pub enum LaunchError {
     #[error(transparent)]
@@ -302,6 +315,7 @@ pub async fn start_game(
 
             let offer = offer.as_ref().unwrap();
             if needs_license_update(&content_id).await? {
+                set_launch_step("Requesting the game license");
                 info!(
                     "Requesting new game license for {}...",
                     offer.offer().display_name()
@@ -497,6 +511,7 @@ pub async fn start_game(
         }
     }
 
+    set_launch_step("Waiting for the game to connect");
     maxima.playing = Some(ActiveGameContext::new(
         &launch_id,
         dir,
