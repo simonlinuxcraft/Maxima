@@ -1402,13 +1402,33 @@ fn extract_archive<R: Read + Sized>(
 // which made the launch flow take >90min and never reach the game.
 // Reading the files costs milliseconds and needs no wine at all.
 
-fn wineserver_running() -> bool {
-    std::process::Command::new("pgrep")
-        .arg("-x")
-        .arg("wineserver")
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+// MAXIMA-LINUX-PORT-MOD: only a wineserver for our own prefix holds our registry
+// in memory, so a Steam game or Lutris running next to Kyber must not force the
+// slow umu path. A wineserver whose prefix cannot be read counts as ours, which
+// only costs time.
+pub fn wineserver_running() -> bool {
+    let Ok(out) = std::process::Command::new("pgrep").args(["-x", "wineserver"]).output() else {
+        return false;
+    };
+    let Some(ours) = wine_prefix_dir().ok().and_then(|p| p.canonicalize().ok()) else {
+        return !out.stdout.is_empty();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .any(|pid| wineserver_prefix(pid).map_or(true, |p| p == ours))
+}
+
+// None when the process is gone, hides its environment or has no usable
+// WINEPREFIX. A relative one is relative to the wineserver's cwd, not ours.
+fn wineserver_prefix(pid: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = env.split(|b| *b == 0).find_map(|kv| kv.strip_prefix(b"WINEPREFIX="))?;
+    let prefix = Path::new(OsStr::from_bytes(prefix));
+    if !prefix.is_absolute() {
+        return None;
+    }
+    prefix.canonicalize().ok()
 }
 
 // Section-aware check for a "Name"="Value" line in Wine .reg file text.
@@ -1521,6 +1541,74 @@ fn verify_registry_files_for_bf2() -> bool {
         }
     }
     true
+}
+
+// MAXIMA-LINUX-PORT-MOD: REGEDIT4 text for the 64-bit reg.exe. A /reg:32 entry
+// under HKLM\Software is written to Software\Wow6432Node, where /reg:32 lands
+// too. Wine's `reg import` returns 0 even for a malformed line, so the format is
+// covered by a test. None for anything this mapping does not cover.
+fn reg_import_text(entries: &[(&str, &str, &str, &str)]) -> Option<String> {
+    let esc = |s: &str| s.replace('\\', r"\\").replace('"', "\\\"");
+    let mut text = String::from("REGEDIT4\r\n");
+    for (key, name, data, view) in entries {
+        let key = match (key.strip_prefix(r"HKLM\"), key.strip_prefix(r"HKCU\")) {
+            (Some(rest), _) => format!(r"HKEY_LOCAL_MACHINE\{rest}"),
+            (_, Some(rest)) => format!(r"HKEY_CURRENT_USER\{rest}"),
+            _ => return None,
+        };
+        let key = match *view {
+            "/reg:64" => key,
+            "/reg:32" => key
+                .strip_prefix(r"HKEY_LOCAL_MACHINE\Software\")
+                .map(|rest| format!(r"HKEY_LOCAL_MACHINE\Software\Wow6432Node\{rest}"))?,
+            _ => return None,
+        };
+        text += &format!("\r\n[{key}]\r\n\"{}\"=\"{}\"\r\n", esc(name), esc(data));
+    }
+    Some(text)
+}
+
+// The given entry, the file's last one, is read back: if it went in, all did.
+async fn import_registry(
+    text: &str,
+    (key, name, data, view): (&str, &str, &str, &str),
+) -> Result<(), NativeError> {
+    let prefix = wine_prefix_dir()?;
+    // A prefix umu has not set up yet is left to the per-entry loop.
+    if !prefix.join("system.reg").exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "prefix not set up yet").into());
+    }
+    let file_name = format!("kyber-registry-{}.reg", std::process::id());
+    let file = prefix.join("drive_c/windows/temp").join(&file_name);
+    if let Some(dir) = file.parent() {
+        create_dir_all(dir)?;
+    }
+    std::fs::write(&file, text)?;
+    let win_file = format!(r"C:\windows\temp\{file_name}");
+    let result = run_wine_command(
+        "reg",
+        Some(vec!["import", win_file.as_str()]),
+        None,
+        false,
+        CommandType::Run,
+    )
+    .await;
+    remove_file(&file).ok();
+    result?;
+
+    let out = run_wine_command(
+        "reg",
+        Some(vec!["query", key, "/v", name, view]),
+        None,
+        true,
+        CommandType::Run,
+    )
+    .await?;
+    if out.lines().any(|l| l.contains(name) && l.contains(data)) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "imported values not found").into())
+    }
 }
 
 /// Each `reg add` invocation is routed through the same wine command
@@ -1704,6 +1792,24 @@ pub async fn setup_wine_registry() -> Result<(), NativeError> {
          applying full set of {} reg add entries",
         ENTRIES.len()
     );
+
+    // MAXIMA-LINUX-PORT-MOD: one `reg import` instead of 13 umu round-trips of
+    // ~3 s each. If it cannot run, the per-entry loop below does the work as before.
+    if let Some(text) = reg_import_text(ENTRIES) {
+        crate::core::launch::set_launch_step("Writing the Wine registry");
+        match import_registry(&text, ENTRIES[ENTRIES.len() - 1]).await {
+            Ok(()) => {
+                log::info!(
+                    "setup_wine_registry: done ({} entries via reg import)",
+                    ENTRIES.len()
+                );
+                return Ok(());
+            }
+            Err(err) => log::warn!(
+                "setup_wine_registry: reg import failed ({err}), writing entries one by one"
+            ),
+        }
+    }
 
     let mut failures: Vec<&str> = Vec::new();
     let mut critical_failures: Vec<&str> = Vec::new();
@@ -1945,6 +2051,58 @@ pub async fn get_mx_wine_registry_value(query_key: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wineserver_prefix_reads_another_process() {
+        let dir = std::env::temp_dir();
+        const MARKER: &[u8] = b"MAXIMA_TEST_EXECED=1";
+        let spawn = |prefix: Option<&Path>| {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("5").env_remove("WINEPREFIX").env("MAXIMA_TEST_EXECED", "1");
+            if let Some(p) = prefix {
+                cmd.env("WINEPREFIX", p);
+            }
+            let child = cmd.spawn().unwrap();
+            // spawn() can return while the child is still inside exec.
+            let environ = format!("/proc/{}/environ", child.id());
+            for _ in 0..200 {
+                if std::fs::read(&environ).is_ok_and(|e| e.windows(MARKER.len()).any(|w| w == MARKER)) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            child
+        };
+        let mut with = spawn(Some(&dir));
+        let mut without = spawn(None);
+        let mut relative = spawn(Some(Path::new(".")));
+        assert_eq!(wineserver_prefix(&with.id().to_string()), dir.canonicalize().ok());
+        assert_eq!(wineserver_prefix(&without.id().to_string()), None);
+        assert_eq!(wineserver_prefix(&relative.id().to_string()), None);
+        with.kill().ok();
+        without.kill().ok();
+        relative.kill().ok();
+    }
+
+    #[test]
+    fn reg_import_text_maps_views_and_escapes() {
+        let text = reg_import_text(&[
+            (r"HKLM\Software\Origin", "ClientPath", r#"C:\a "b""#, "/reg:32"),
+            (r"HKLM\Software\WoW6432Node\Origin Games\1", "locale", "en_US", "/reg:64"),
+            (r"HKCU\Environment", "LANG", "en_US.UTF-8", "/reg:64"),
+        ])
+        .unwrap();
+        assert_eq!(
+            text,
+            "REGEDIT4\r\n\
+             \r\n[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Origin]\r\n\"ClientPath\"=\"C:\\\\a \\\"b\\\"\"\r\n\
+             \r\n[HKEY_LOCAL_MACHINE\\Software\\WoW6432Node\\Origin Games\\1]\r\n\"locale\"=\"en_US\"\r\n\
+             \r\n[HKEY_CURRENT_USER\\Environment]\r\n\"LANG\"=\"en_US.UTF-8\"\r\n"
+        );
+        // Anything the mapping does not cover goes through the per-entry loop.
+        assert_eq!(reg_import_text(&[(r"HKCU\Software\X", "a", "b", "/reg:32")]), None);
+        assert_eq!(reg_import_text(&[(r"HKCR\X", "a", "b", "/reg:64")]), None);
+    }
 
     #[test]
     fn version_file_beats_the_directory_name() {
